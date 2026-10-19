@@ -2088,6 +2088,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: --relaunch refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
     exit 1
   }
+  # A relaunch rewrites harness wiring and git hooks in the recorded worktree,
+  # which for an adopted task (bin/fm-adopt.sh) is a directory firstmate does
+  # not own.
+  if [ "$(fm_meta_get "$RELAUNCH_META" adopted)" = 1 ]; then
+    echo "error: task $ID is an adopted agent; relaunch would rewrite files in its own directory, so steer it with bin/fm-send.sh instead" >&2
+    exit 1
+  fi
   fm_backend_validate_task_endpoint "$RELAUNCH_META" "$ID" || exit 1
   BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   RELAUNCH_TARGET=$FM_BACKEND_VALIDATED_TARGET
@@ -5835,10 +5842,7 @@ preserve_relaunch_meta() {
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
   if [ "$BACKEND" = herdr ]; then
-    echo "herdr_session=$HERDR_SES"
-    echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
-    echo "herdr_tab_id=$HERDR_TAB_ID"
-    echo "herdr_pane_id=$HERDR_PANE_ID"
+    fm_backend_herdr_endpoint_meta_lines "$HERDR_SES" "$HERDR_WORKSPACE_ID" "$HERDR_TAB_ID" "$HERDR_PANE_ID"
   fi
   if [ "$BACKEND" = zellij ]; then
     echo "zellij_session=$ZELLIJ_SES"

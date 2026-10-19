@@ -427,6 +427,47 @@ ROWS
   pass "fm-brief.sh: --yolo and scout/secondmate --mode are refused, never silently dropped"
 }
 
+# --adopted (bin/fm-adopt.sh) keeps an already-running agent's work: no
+# isolation check, no new branch, no discarded scratch copy, and the existing
+# branch named through --branch; every other contract section is unchanged.
+test_adopted_brief_keeps_the_agents_work() {
+  local home brief out status
+  home="$TMP_ROOT/adopted-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" adopted-ship some-proj --adopted --mode direct-PR --branch feature/login >/dev/null 2>&1
+  status=$?
+  expect_code 0 "$status" "fm-brief.sh --adopted ship should exit 0"
+  brief="$home/data/adopted-ship/brief.md"
+  assert_grep "Firstmate adopted you" "$brief" "adopted ship: Setup does not explain the adoption"
+  assert_grep "Keep your current work, conversation, directory, and branch" "$brief" "adopted ship: Setup does not keep the agent's work"
+  assert_grep "reports your current state" "$brief" "adopted ship: the first status event is not the current state"
+  assert_no_grep "git checkout -b" "$brief" "adopted ship: the agent is told to create a branch"
+  assert_no_grep "Verify isolation" "$brief" "adopted ship: the agent is told to run the isolation check"
+  assert_no_grep "{TASK}" "$brief" "adopted ship: the Task placeholder was left for a hand fill"
+  grep -qx "Delivery contract: mode=direct-PR" "$brief" || fail "adopted ship: delivery contract line missing"
+  grep -qx "Ship branch: feature/login" "$brief" || fail "adopted ship: the existing branch is not the ship branch"
+  assert_grep "Report status by appending one line" "$brief" "adopted ship: status protocol missing"
+  assert_grep "# Firstmate instruction inbox" "$brief" "adopted ship: inbox section missing"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" adopted-scout some-proj --adopted --scout >/dev/null 2>&1
+  status=$?
+  expect_code 0 "$status" "fm-brief.sh --adopted --scout should exit 0"
+  brief="$home/data/adopted-scout/brief.md"
+  assert_grep "Firstmate adopted you" "$brief" "adopted scout: Setup does not explain the adoption"
+  assert_no_grep "discarded at teardown" "$brief" "adopted scout: the agent's directory is called scratch"
+  assert_grep "report.md" "$brief" "adopted scout: report deliverable missing"
+
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" plain-ship some-proj --mode direct-PR --branch feature/x 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "--branch without --adopted should be refused"
+  assert_contains "$out" "--branch applies only to --adopted ship briefs" "--branch without --adopted: refusal does not explain why"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" adopted-mate --secondmate --no-projects --adopted 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "--adopted on a secondmate charter should be refused"
+  assert_contains "$out" "--adopted applies only to ship and scout briefs" "--adopted secondmate: refusal does not explain why"
+  pass "fm-brief.sh: an adopted brief keeps the agent's work and names its existing branch"
+}
+
 test_faster_paths_use_configured_authority_without_stacked_review() {
   local home id brief
   home="$TMP_ROOT/configured-authority-home"
@@ -1638,6 +1679,7 @@ test_forge_external_renders_the_review_rail
 test_ship_mode_is_required_and_closed_set
 test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
+test_adopted_brief_keeps_the_agents_work
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_green_detection

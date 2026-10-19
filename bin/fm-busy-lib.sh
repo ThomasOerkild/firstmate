@@ -72,7 +72,9 @@
 #      keeps its ordinary busy verdict and the general BUSY_TURN_MAX_SECS
 #      bound is unchanged.
 #   4. no record at all: herdr's native busy verdict is trusted as busy
-#      (generation state is sufficient for busy, not for idle), then the
+#      (generation state is sufficient for busy, not for idle; an adopted
+#      task's native idle is trusted too, because bin/fm-adopt.sh installs
+#      no hooks, so herdr is its only semantic source), then the
 #      muse session-log and cursor transcript pull sources, then the
 #      Grok/Rovo/AGY temporary regex fallbacks classify a grok, rovo, or agy
 #      task from its rendered tail, then unknown missing
@@ -1085,11 +1087,16 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   # No record at all. A native herdr busy verdict is semantic enough to trust
   # for BUSY (streaming means a turn is running); native idle is narrower
   # than turn state (a long foreground tool call reads idle) and stays
-  # unknown here.
+  # unknown here, except for an adopted task, which has no hook record by
+  # design.
   if [ "$backend" = herdr ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
     native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)
     if [ "$native" = busy ]; then
       printf 'busy herdr-native'
+      return 0
+    fi
+    if [ "$native" = idle ] && [ "$(fm_meta_get "$state/$id.meta" adopted 2>/dev/null)" = 1 ]; then
+      printf 'idle herdr-native'
       return 0
     fi
   fi

@@ -2652,6 +2652,29 @@ test_no_run_herdr_unknown_uses_backend_capture() {
   pass "herdr's native busy verdict reads working with no record present"
 }
 
+# An adopted task (bin/fm-adopt.sh) has no hook record by design, so herdr's
+# native idle is its only idle source and lets the status log decide the state.
+# The same record without adopted=1 keeps the narrower unknown verdict.
+test_no_run_adopted_herdr_idle_reads_the_status_log() {
+  command -v jq >/dev/null 2>&1 || { pass "adopted herdr idle test skipped without jq"; return; }
+  reset_fakes
+  local d out; d=$(new_case herdr-adopted-idle)
+  mkdir -p "$d/wt"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/adopted-x.meta" "window=default:w1:p2" "worktree=$d/wt" "kind=scout" \
+    "backend=herdr" "harness=claude" "adopted=1"
+  printf 'blocked [at=1]: need the staging credential\n' > "$d/state/adopted-x.status"
+  FM_FAKE_TMUX_MISSING=1
+  FM_FAKE_HERDR_AGENT_STATUS=idle
+  out=$(run_crew_state "$d" adopted-x)
+  assert_contains "$out" "state: blocked" "an adopted idle task reads its status-log state"
+  assert_contains "$out" "need the staging credential" "the adopted task's status line is the detail"
+  sed -i.bak '/^adopted=1$/d' "$d/state/adopted-x.meta"
+  out=$(run_crew_state "$d" adopted-x)
+  assert_contains "$out" "state: unknown" "a hookless record that is not adopted keeps native idle unknown"
+  pass "an adopted herdr task reads its status log once herdr reports it idle"
+}
+
 # Regression (2026-09 G7 stale-claim incident): a herdr CLI that errors or
 # stalls under load made pane_readable's capture fail, and the fallback read
 # that single failure as "backend target gone" - text the stale sweep matches
@@ -5786,6 +5809,7 @@ test_no_run_launch_prompt_parked_is_not_working
 test_no_run_footer_text_alone_is_not_working
 test_no_run_grok_uses_isolated_fallback
 test_no_run_herdr_unknown_uses_backend_capture
+test_no_run_adopted_herdr_idle_reads_the_status_log
 test_no_run_herdr_cli_failure_reads_unreachable_not_gone
 test_no_run_herdr_alive_with_failed_read_stays_live
 test_no_run_herdr_husk_dead_still_reads_gone

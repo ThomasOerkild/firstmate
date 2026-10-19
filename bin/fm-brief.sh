@@ -16,6 +16,7 @@
 # PR instead of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|forgejo|external> [--shape squash]] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
+#        fm-brief.sh <task-id> <repo-name> --adopted {--mode <mode> [--branch <name>]|--scout}
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -32,6 +33,14 @@
 #   omitting both still fails loudly so an accidental omission is never silent.
 #   Set FM_SECONDMATE_CHARTER='<charter>' to fill the charter text.
 #   Set FM_SECONDMATE_SCOPE='<scope>' to write a routing scope distinct from the charter text.
+#   --adopted writes the contract for an agent firstmate did not start
+#   (bin/fm-adopt.sh): its Task is filled in, and its Setup tells the agent to
+#   keep its current work, directory, and branch and to report its current
+#   state first, in place of the isolation check, branch creation, and scratch
+#   copy. Every rule, the inbox section, and the Definition of done are the
+#   ordinary ones. --branch <name> names an adopted ship's existing branch and
+#   replaces the prefix-plus-id branch; it is refused without --adopted.
+#   --base-branch is refused with --adopted, because the agent keeps its base.
 #   --herdr-lab is mandatory when the task will issue Herdr lifecycle commands.
 #   It adds the hard isolation contract backed by bin/fm-herdr-lab.sh.
 #   The flag must be explicit because {TASK} and {FIRSTMATE_SPEC} are filled
@@ -225,6 +234,9 @@ UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 PROJECT_DIR=
 PROJECT_DIR_SET=0
+ADOPTED=0
+BRANCH_NAME=
+BRANCH_NAME_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -240,6 +252,7 @@ for a in "$@"; do
       shape) SHAPE=$a; SHAPE_SET=1 ;;
       upstream-consent) UPSTREAM_CONSENT=$a; UPSTREAM_CONSENT_SET=1 ;;
       project) PROJECT_DIR=$a; PROJECT_DIR_SET=1 ;;
+      branch) BRANCH_NAME=$a; BRANCH_NAME_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -264,6 +277,9 @@ for a in "$@"; do
     --upstream-consent=*) UPSTREAM_CONSENT=${a#--upstream-consent=}; UPSTREAM_CONSENT_SET=1 ;;
     --project) want_value="project" ;;
     --project=*) PROJECT_DIR=${a#--project=}; PROJECT_DIR_SET=1 ;;
+    --adopted) ADOPTED=1 ;;
+    --branch) want_value=branch ;;
+    --branch=*) BRANCH_NAME=${a#--branch=}; BRANCH_NAME_SET=1 ;;
     # yolo never reaches the worker: it is firstmate's merge authority, not a
     # brief input. Refuse it loudly so it is never silently dropped here and then
     # believed to have been recorded.
@@ -380,10 +396,34 @@ if [ "$KIND" = ship ] && [ "$MODE" != local-only ] && [ "$PROJECT_DIR_SET" -eq 1
       ;;
   esac
 fi
+if [ "$ADOPTED" -eq 1 ]; then
+  if [ "$KIND" = secondmate ]; then
+    echo "error: --adopted applies only to ship and scout briefs" >&2
+    exit 1
+  fi
+  if [ "$BASE_BRANCH_SET" -eq 1 ]; then
+    echo "error: --base-branch does not apply to --adopted; an adopted agent keeps its current base" >&2
+    exit 1
+  fi
+fi
+if [ "$BRANCH_NAME_SET" -eq 1 ]; then
+  if [ "$ADOPTED" -eq 0 ] || [ "$KIND" != ship ]; then
+    echo "error: --branch applies only to --adopted ship briefs; a spawned ship's branch is <prefix><task-id>" >&2
+    exit 1
+  fi
+  if [ "$BRANCH_PREFIX_SET" -eq 1 ]; then
+    echo "error: --branch and --branch-prefix are exclusive" >&2
+    exit 1
+  fi
+fi
 ID=${POS[0]}
-BRANCH="$BRANCH_PREFIX$ID"
+if [ "$BRANCH_NAME_SET" -eq 1 ]; then
+  BRANCH=$BRANCH_NAME
+else
+  BRANCH="$BRANCH_PREFIX$ID"
+fi
 if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
-  echo "error: --branch-prefix and task id must form a valid git branch (got '$BRANCH')" >&2
+  echo "error: the ship branch must be a valid git branch (got '$BRANCH')" >&2
   exit 1
 fi
 printf -v BRANCH_Q '%q' "$BRANCH"
@@ -635,6 +675,25 @@ IFS= read -r -d '' TASK_SECTION <<'EOF' || true
 {FIRSTMATE_SPEC}
 EOF
 TASK_SECTION=${TASK_SECTION%$'\n'}
+if [ "$ADOPTED" -eq 1 ]; then
+IFS= read -r -d '' TASK_SECTION <<'EOF' || true
+# Task
+## Captain's intent
+The work this agent session was already doing when firstmate adopted it; the session's own conversation holds that ask.
+
+## Firstmate spec
+Continue that work under this contract; firstmate supervises it from now on.
+EOF
+TASK_SECTION=${TASK_SECTION%$'\n'}
+IFS= read -r -d '' ADOPTED_SETUP <<'EOF' || true
+# Setup
+Firstmate adopted you while you were already at work: you were started outside firstmate, and firstmate supervises you from now on.
+Keep your current work, conversation, directory, and branch; do not create a branch or worktree, and do not move to another directory.
+Wherever this contract says worktree, it means your current directory, and firstmate never deletes, resets, or recycles it.
+First action: append one status line under rule 4 that reports your current state - what you are doing now, or `done:`, `blocked:`, or `needs-decision:` when that is your state.
+EOF
+ADOPTED_SETUP=${ADOPTED_SETUP%$'\n'}
+fi
 
 # One shared string keeps the ship and scout infrastructure rule identical.
 # Rule 2 governs file edits, so it does not prohibit pool administration.
@@ -679,6 +738,16 @@ if "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
 else
   LAVISH_LINE='Lavish is unavailable (lavish-axi is missing or below its supported version floor), so deliver your findings as a text report without Lavish, even for a visual deliverable.'
 fi
+if [ "$ADOPTED" -eq 1 ]; then
+  SCOUT_SETUP="$ADOPTED_SETUP
+This is a SCOUT task: the deliverable is a written report, not a PR."
+else
+  SCOUT_SETUP="# Setup
+$SETUP_BASE
+This is a SCOUT task: the deliverable is a written report, not a PR.
+The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
+The report is the only thing that survives, so anything worth keeping must be in it."
+fi
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -686,11 +755,7 @@ $TASK_SECTION
 
 $HERDR_SECTION
 
-# Setup
-$SETUP_BASE
-This is a SCOUT task: the deliverable is a written report, not a PR.
-The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
-The report is the only thing that survives, so anything worth keeping must be in it.
+$SCOUT_SETUP
 
 # Rules
 1. Never push to any remote and never open a PR.
@@ -749,6 +814,18 @@ case "$MODE" in
 esac
 RULE1=$(fm_ship_rule_one "$MODE" "$ID" "$BRANCH" "$FORGE" "$BASE_BRANCH") || exit 1
 DOD=$(fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE" "$BASE_BRANCH" "$UPSTREAM_CONSENT") || exit 1
+if [ "$ADOPTED" -eq 1 ]; then
+  SHIP_SETUP=$ADOPTED_SETUP
+else
+  SHIP_SETUP="# Setup
+$SETUP_BASE
+
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree\` to the status file and stop.
+
+1. First action: create your branch: \`git checkout -b $BRANCH_Q --\`$SETUP2"
+fi
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -757,14 +834,7 @@ $TASK_SECTION
 
 $HERDR_SECTION
 
-# Setup
-$SETUP_BASE
-
-**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
-The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
-If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree\` to the status file and stop.
-
-1. First action: create your branch: \`git checkout -b $BRANCH_Q --\`$SETUP2
+$SHIP_SETUP
 
 # Rules
 $RULE1

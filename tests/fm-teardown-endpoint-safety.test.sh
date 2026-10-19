@@ -983,6 +983,73 @@ test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot() {
   pass "fm-teardown: a pool slot claimed by another task is left alone while the task's own cleanup finishes"
 }
 
+write_logging_herdr() {  # <case>
+  cat > "$1/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf 'herdr' >> "${FM_RUNTIME_LOG:?}"
+printf ' <%s>' "$@" >> "${FM_RUNTIME_LOG:?}"
+printf '\n' >> "${FM_RUNTIME_LOG:?}"
+case "${1:-} ${2:-}" in
+  "status --json") printf '%s\n' '{"server":{"running":true}}' ;;
+  "pane get") printf '{"result":{"pane":{"pane_id":"%s","tab_id":"w9:t1","workspace_id":"w9"}}}\n' "${3:-}" ;;
+  "agent get") printf '{"result":{"agent":{"pane_id":"%s","agent":"claude","agent_status":"working"}}}\n' "${3:-}" ;;
+esac
+exit 0
+SH
+  chmod +x "$1/fakebin/herdr"
+}
+
+# An adopted task (bin/fm-adopt.sh) runs an agent firstmate did not start, in a
+# directory firstmate does not own: teardown removes only firstmate's records.
+test_adopted_task_teardown_leaves_directory_and_pane_alone() {
+  local dir id=adopted-task worker rc head
+  dir=$(make_case adopted)
+  mark_case_as_treehouse_pool "$dir"
+  write_logging_herdr "$dir"
+  git -C "$dir/worktree" switch -q -c own-work
+  git -C "$dir/worktree" -c user.name=test -c user.email=test@example.invalid \
+    commit --allow-empty -qm unpushed
+  head=$(git -C "$dir/worktree" rev-parse HEAD)
+  printf 'draft\n' > "$dir/worktree/uncommitted.txt"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=default:w9:p1" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "harness=claude" \
+    "kind=ship" "mode=direct-PR" "yolo=off" "branch=own-work" \
+    "spawn_gen=a1.1.1" "backend=herdr" "herdr_session=default" \
+    "herdr_workspace_id=w9" "herdr_tab_id=w9:t1" "herdr_pane_id=w9:p1" "adopted=1"
+  : > "$dir/home/state/$id.status"
+  mkdir -p "$dir/home/state/$id.inbox/handled"
+  ( cd "$dir/worktree" && exec sleep 30 ) &
+  worker=$!
+
+  set +e
+  FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_RUNTIME_LOG="$dir/runtime.log" PATH="$dir/fakebin:$PATH" \
+    "$TEARDOWN" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+
+  kill -0 "$worker" 2>/dev/null || fail "adopted teardown killed a process in the adopted directory"
+  kill "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "adopted teardown with unlanded work failed: $(cat "$dir/stderr")"
+  assert_absent "$dir/home/state/$id.meta" "adopted teardown kept its task record"
+  assert_absent "$dir/home/state/$id.status" "adopted teardown kept its status record"
+  assert_absent "$dir/home/state/$id.inbox" "adopted teardown kept its steering inbox"
+  assert_present "$dir/worktree/sentinel" "adopted teardown reset the adopted directory"
+  assert_present "$dir/worktree/uncommitted.txt" "adopted teardown discarded uncommitted work"
+  [ "$(git -C "$dir/worktree" symbolic-ref --short HEAD)" = own-work ] \
+    || fail "adopted teardown moved the agent off its branch"
+  [ "$(git -C "$dir/worktree" rev-parse own-work)" = "$head" ] \
+    || fail "adopted teardown changed the agent's branch"
+  ! grep -Fq "treehouse <return>" "$dir/runtime.log" \
+    || fail "adopted teardown returned the directory to the pool: $(cat "$dir/runtime.log")"
+  ! grep -Fq "herdr <pane> <close>" "$dir/runtime.log" \
+    || fail "adopted teardown closed the adopted pane: $(cat "$dir/runtime.log")"
+  assert_contains "$(cat "$dir/stdout")" "adopted" "adopted teardown should say what it left alone"
+  pass "fm-teardown: an adopted task's cleanup removes only firstmate's records"
+}
+
 # The reuse collision where BOTH records survive: the stale task's record still
 # names the slot the pool handed on, and the claimant's own record names it too.
 # The claim proves the stale record's teardown is records-only, so the record
@@ -1440,6 +1507,7 @@ test_reused_pool_slot_refuses_before_touching_the_other_task
 test_cross_home_pool_slot_collision_refuses
 test_sole_slot_record_still_tears_down
 test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot
+test_adopted_task_teardown_leaves_directory_and_pane_alone
 test_stale_record_on_claimed_slot_retires_then_claimant_tears_down
 test_own_and_absent_slot_claims_still_tear_down
 test_recorded_endpoint_that_changed_directory_still_tears_down

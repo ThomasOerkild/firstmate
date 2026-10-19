@@ -169,6 +169,11 @@
 # own is removed by a refusal; reconcile whichever record is wrong and re-run.
 # Orca is not a pool slot and proves its path through
 # require_orca_worktree_path_match instead.
+# An adopted task (adopted=1, written by bin/fm-adopt.sh) runs an agent firstmate
+# did not start, in a directory firstmate does not own. Its teardown removes only
+# firstmate's own records and backlog item: no landed-work check, process kill,
+# branch or hook removal, clean, or return in that directory, and no endpoint
+# close, so the agent keeps running in its pane.
 # Orca tasks use the same safety checks, then close the recorded terminal and
 # remove the recorded worktree through `orca worktree rm`; teardown never guesses
 # an Orca target from ambient CLI state.
@@ -543,6 +548,8 @@ fm_backlog_record_present "$META" "task record" "$STATE" || {
 }
 TEARDOWN_META_KIND=$(fm_meta_get "$META" kind)
 [ -n "$TEARDOWN_META_KIND" ] || TEARDOWN_META_KIND=ship
+TEARDOWN_ADOPTED=0
+[ "$(fm_meta_get "$META" adopted)" != 1 ] || TEARDOWN_ADOPTED=1
 # Retiring a persistent secondmate is main's alone in both postures; the kind
 # is read under the metadata lock (role partition: bin/fm-lease-lib.sh).
 [ "$TEARDOWN_META_KIND" != secondmate ] || fm_lease_forbid_branch "secondmate retirement (fm-teardown)"
@@ -2419,6 +2426,7 @@ require_orca_worktree_path_match_if_present() {
 # record with nothing live to return skips them rather than refusing.
 teardown_live_slot_path() {
   [ "$KIND" != secondmate ] || return 1
+  [ "$TEARDOWN_ADOPTED" != 1 ] || return 1
   fm_treehouse_pool_slot "$PROJ" "$WT" || return 1
   canonical_existing_dir "$WT"
 }
@@ -2537,7 +2545,7 @@ require_owned_task_worktree_slot() {
 }
 
 teardown_owns_worktree() {
-  [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ]
+  [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ] && [ "$TEARDOWN_ADOPTED" != 1 ]
 }
 
 firstmate_home_has_treehouse_slot() {
@@ -3557,7 +3565,7 @@ fi
 # refuses before any destructive step.
 TEARDOWN_HERDR_SESSION=
 TEARDOWN_HERDR_PANE=
-if [ "$BACKEND" = herdr ]; then
+if [ "$BACKEND" = herdr ] && [ "$TEARDOWN_ADOPTED" != 1 ]; then
   teardown_herdr_preflight_target "$T" "$ID" || exit 1
   fm_backend_herdr_parse_target "$T" || exit 1
   TEARDOWN_HERDR_SESSION=$FM_BACKEND_HERDR_SESSION
@@ -3652,7 +3660,7 @@ fi
 if [ "$KIND" != secondmate ] && teardown_owns_worktree; then
   conclude_task_no_mistakes_run "$WT"
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
-elif [ "$KIND" != secondmate ]; then
+elif [ "$KIND" != secondmate ] && [ "$TEARDOWN_ADOPTED" != 1 ]; then
   reap_task_worktree_processes tasktmp "$TASK_TMP"
 fi
 if [ "$KIND" = ship ] && teardown_owns_worktree && [ -e "$CONFIG/pipeline-spend" ]; then
@@ -3746,7 +3754,7 @@ teardown_herdr_journal_orphaned() {
 HERDR_PRESENTATION_RETIRE_CANDIDATE=0
 HERDR_PRESENTATION_SESSION=
 HERDR_PRESENTATION_PANE=
-if [ "$BACKEND" = herdr ] \
+if [ "$BACKEND" = herdr ] && [ "$TEARDOWN_ADOPTED" != 1 ] \
    && { [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; }; then
   fm_backend_source herdr || true
   HERDR_PRESENTATION_SESSION=$(meta_value "$META" herdr_session)
@@ -3780,6 +3788,9 @@ if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   else
     echo "warning: herdr presentation focus lock unavailable; refusing a concurrent focus-unsafe pane close" >&2
   fi
+elif [ "$TEARDOWN_ADOPTED" = 1 ]; then
+  # An adopted agent's endpoint was never firstmate's to close.
+  :
 elif [ "$BACKEND" = herdr ]; then
   if teardown_herdr_session_lock_held "$TEARDOWN_HERDR_SESSION"; then
     fm_backend_herdr_kill_serialized "$TEARDOWN_HERDR_SESSION" "$TEARDOWN_HERDR_PANE" 2>/dev/null || true
@@ -3796,7 +3807,7 @@ if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   else
     echo "warning: exact herdr task-pane close could not be confirmed for $ID; retaining the presentation journal and attempting no workspace cleanup" >&2
   fi
-elif [ "$BACKEND" = herdr ] \
+elif [ "$BACKEND" = herdr ] && [ "$TEARDOWN_ADOPTED" != 1 ] \
      && { [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; }; then
   echo "warning: herdr presentation journal for $ID was not retired by its close; no workspace cleanup was attempted" >&2
 fi
@@ -3805,8 +3816,8 @@ fi
 # every record and stop before any removal below so a later rerun can retry
 # the locked close. Only a structured not-found proves the pane gone; unknown
 # presence, missing or malformed endpoint identity, and missing confirmation
-# machinery all refuse.
-if [ "$BACKEND" = herdr ]; then
+# machinery all refuse. An adopted pane stays open by design.
+if [ "$BACKEND" = herdr ] && [ "$TEARDOWN_ADOPTED" != 1 ]; then
   fm_backend_source herdr || true
   if ! declare -F fm_backend_herdr_endpoint_confirmed_gone >/dev/null 2>&1; then
     echo "error: herdr endpoint confirmation is unavailable for $ID; retaining every durable task record" >&2
@@ -3965,6 +3976,8 @@ elif [ "$TEARDOWN_LEGACY_ACCEPTED" = 1 ]; then
   echo "teardown $ID complete (window ${T:-none}, worktree $WT, legacy record accepted without spawn_gen: endpoint $TEARDOWN_LEGACY_ENDPOINT, incarnation $TEARDOWN_META_SPAWN_GEN)"
 elif teardown_owns_worktree; then
   echo "teardown $ID complete (window ${T:-none}, worktree $WT)"
+elif [ "$TEARDOWN_ADOPTED" = 1 ]; then
+  echo "teardown $ID complete (adopted: window ${T:-none} and directory $WT left untouched; only firstmate's records were removed)"
 else
   echo "teardown $ID complete (window ${T:-none}; pool slot $WT left to task $TEARDOWN_SLOT_REASSIGNED_TO${TEARDOWN_SLOT_REASSIGNED_HOME:+ (home $TEARDOWN_SLOT_REASSIGNED_HOME)}, which it was reassigned to)"
 fi

@@ -3056,6 +3056,14 @@ fm_backend_herdr_projection_token_workspace_gone() {  # <session> <journal> <tas
   [ "$verdict" = "gone" ]
 }
 
+# fm_backend_herdr_endpoint_meta_lines: the herdr endpoint keys of a task
+# record, in the order bin/fm-backend.sh's fm_backend_validate_task_endpoint
+# reads them; the record's window= is "<session>:<pane>". Shared by
+# bin/fm-spawn.sh and bin/fm-adopt.sh.
+fm_backend_herdr_endpoint_meta_lines() {  # <session> <workspace_id> <tab_id> <pane_id>
+  printf 'herdr_session=%s\nherdr_workspace_id=%s\nherdr_tab_id=%s\nherdr_pane_id=%s\n' "$1" "$2" "$3" "$4"
+}
+
 # fm_backend_herdr_parse_target: split "<session>:<pane_id>" (pane_id itself
 # contains a colon, e.g. "w1:p2") on the FIRST colon only. Sets
 # FM_BACKEND_HERDR_SESSION and FM_BACKEND_HERDR_PANE for the caller.
