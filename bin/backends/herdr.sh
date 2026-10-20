@@ -3160,31 +3160,28 @@ fm_backend_herdr_send_key() {  # <target> <key>
 # fm-peek.sh's/fm-watch.sh's `tmux capture-pane -p -t T -S -N`. --source recent
 # is the closest herdr analogue to tmux's scrollback-bounded capture.
 #
-# Verified CLI quirk (herdr-verification-p2.md "pane read --lines bug", v0.7.1):
-# `pane read --source recent --lines N` returns COMPLETELY EMPTY output when N
-# is smaller than the pane's current viewport height (observed threshold ~23
-# rows for a default-sized pane), instead of clamping to the last N lines - it
-# does not merely ignore the bound, it drops the read entirely. This silently
-# broke exactly the small bounded reads this adapter relies on most (the peek
-# and watch tails, the rendered busy-footer read, and the shared inbox
-# pending-line read; the adapter's own composer reads now take the viewport
-# instead, so they need no line count at all). Workaround:
-# always request a generous fetch far above any realistic viewport height, then
-# trim to the caller's requested bound ourselves with `tail`.
+# It requests exactly the caller's line count. On herdr >= 0.8.0, a recent read
+# that asks for more lines than an idle alternate-screen agent's screen holds
+# makes the server scroll the agent with wheel events to collect history and
+# then scroll back, which every attached client sees as a jump. Herdr 0.7.x
+# instead returns empty output when N is below the viewport height
+# (herdr-verification-p2.md "pane read --lines bug"), so an empty read retries
+# once with a 200-line fetch and trims it locally; 0.7.x has no history
+# traversal, so that retry cannot scroll the pane.
 fm_backend_herdr_capture() {  # <target> <lines>
   fm_backend_herdr_target_ready "$1" || return 1
-  local lines=${2:-200} fetch out
+  local lines=${2:-200} out
   case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
-  fetch=$lines
-  case "$fetch" in ''|*[!0-9]*) fetch=200 ;; *) [ "$fetch" -ge 200 ] || fetch=200 ;; esac
-  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines "$fetch" 2>/dev/null) || return 1
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines "$lines" 2>/dev/null) || return 1
+  if [ -z "$out" ] && [ "$lines" -lt 200 ]; then
+    out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source recent --lines 200 2>/dev/null) || return 1
+  fi
   printf '%s' "$out" | tail -n "$lines"
 }
 
 # fm_backend_herdr_visible_capture: the visible viewport only. `--source
-# visible` is herdr's viewport-bounded read, so it needs none of the --lines
-# workaround above - the bound is the pane itself, and asking for a line count
-# is what triggers the empty-read bug.
+# visible` is herdr's viewport-bounded read, so it needs no line count - the
+# bound is the pane itself.
 fm_backend_herdr_visible_capture() {  # <target>
   fm_backend_herdr_target_observable "$1" || return 1
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane read "$FM_BACKEND_HERDR_PANE" --source visible 2>/dev/null

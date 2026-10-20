@@ -4569,7 +4569,7 @@ spawn_assert_agent_worktree() {
 }
 
 kimi_capture() {
-  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
+  fm_backend_capture "$BACKEND" "$T" 40 "$W" 2>/dev/null || true
 }
 
 # Trust decisions read the visible pane only. The dialog is a TUI frame, so a
@@ -4727,7 +4727,7 @@ kimi_spawn_fail() { # <detail>
 # like kimi. The banner and context-usage greps are launch-progress signals, not
 # composer shapes.
 rovo_capture() {
-  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
+  fm_backend_capture "$BACKEND" "$T" 40 "$W" 2>/dev/null || true
 }
 
 rovo_composer_is_empty() {
@@ -4824,7 +4824,7 @@ AGY_TRUST_DIALOG='Do you trust the contents of this project?'
 AGY_TRUST_ANSWERED=0
 
 agy_capture() {
-  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
+  fm_backend_capture "$BACKEND" "$T" 40 "$W" 2>/dev/null || true
 }
 
 agy_pane_shows_trust_dialog() {  # <plain-pane-capture>

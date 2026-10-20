@@ -3786,9 +3786,6 @@ test_capture_calls_pane_read() {
   dir="$TMP_ROOT/capture"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf 'line one\nline two\nline three\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
-  # Requesting 250 (already >= the 200 floor) passes straight through as the
-  # fetch bound; the adapter then trims to the caller's requested 250 lines
-  # locally, so all 3 fake lines survive.
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_capture default:w1:p2 250' "$ROOT" )
   [ "$out" = $'line one\nline two\nline three' ] || fail "capture did not pass through pane read output, got '$out'"
@@ -3797,21 +3794,39 @@ test_capture_calls_pane_read() {
   pass "fm_backend_herdr_capture: calls 'pane read <pane> --source recent --lines N' with the session set"
 }
 
-test_capture_works_around_small_lines_bug() {
+test_capture_requests_callers_line_count() {
   local dir log resp fb out
-  # Verified herdr v0.7.1 bug (herdr-verification-p2.md): `pane read --lines N`
-  # for a small N (below the pane's viewport height) returns EMPTY, not the
-  # last N lines. The adapter must never ask herdr for a small --lines bound -
-  # it always fetches >= 200 and trims locally with tail.
+  # A recent read above an idle alternate-screen agent's screen height makes
+  # herdr >= 0.8.0 scroll the agent to collect history, so the adapter asks
+  # for exactly the caller's N and never pads it.
   dir="$TMP_ROOT/capture-small"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf 'a\nb\nc\nd\ne\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_capture default:w1:p2 40' "$ROOT" )
+  [ "$out" = $'a\nb\nc\nd\ne' ] || fail "capture should return the pane read output, got '$out'"
+  assert_contains "$(cat "$log")" $'\x1f''--lines'$'\x1f''40' \
+    "capture should request the caller's own line count"
+  ! grep -Fq $'\x1f''--lines'$'\x1f''200' "$log" \
+    || fail "capture must not pad a non-empty read to 200 lines"
+  pass "fm_backend_herdr_capture: requests the caller's own line count"
+}
+
+test_capture_retries_empty_small_read() {
+  local dir log resp fb out
+  # Herdr 0.7.x returns empty output for `--lines N` below the viewport
+  # height (herdr-verification-p2.md), so an empty read retries with 200 and
+  # trims locally.
+  dir="$TMP_ROOT/capture-empty"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  : > "$resp/1.out"
+  printf 'a\nb\nc\nd\ne\n' > "$resp/2.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_capture default:w1:p2 2' "$ROOT" )
-  [ "$out" = $'d\ne' ] || fail "a small --lines request should still return the last N lines (trimmed locally), got '$out'"
-  assert_contains "$(cat "$log")" $'\x1f''--lines'$'\x1f''200' \
-    "capture should request a generous fetch (>=200), never the caller's small N, from herdr's own --lines flag"
-  pass "fm_backend_herdr_capture: works around the verified small-N '--lines' bug by over-fetching and trimming locally"
+  [ "$out" = $'d\ne' ] || fail "an empty small read should retry and return the last N lines, got '$out'"
+  assert_contains "$(cat "$log")" $'\x1f''--lines'$'\x1f''2' "capture should first request the caller's N"
+  assert_contains "$(cat "$log")" $'\x1f''--lines'$'\x1f''200' "an empty read should retry with a 200-line fetch"
+  pass "fm_backend_herdr_capture: retries an empty small read with a 200-line fetch"
 }
 
 test_capture_preserves_pane_read_failure() {
@@ -6075,7 +6090,8 @@ test_list_live_scoped_to_this_homes_workspace_only
 test_parse_target
 test_normalize_key
 test_capture_calls_pane_read
-test_capture_works_around_small_lines_bug
+test_capture_requests_callers_line_count
+test_capture_retries_empty_small_read
 test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
