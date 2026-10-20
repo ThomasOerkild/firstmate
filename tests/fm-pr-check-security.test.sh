@@ -194,6 +194,7 @@ case " $* " in
     printf '%s\n' '{"permissions":{"push":false}}'
     ;;
   *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+  *" headRefName "*) printf '%s\n' "${FM_TEST_GH_HEAD_BRANCH:-}" ;;
   *" state "*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
     [ -z "${FM_TEST_GH_STATE_STARTED:-}" ] || : > "$FM_TEST_GH_STATE_STARTED"
@@ -757,6 +758,29 @@ test_direct_pr_unpushed_commit_refuses_registration() {
     || fail "direct-PR refusal did not name the unpushed commit: $(cat "$dir/stderr")"
   [ ! -e "$dir/home/state/task-a.check.sh" ] || fail "direct-PR unpushed commit still armed a poll"
   pass "fm-pr-check refuses a direct-PR registration while a later commit is only in the copy"
+}
+
+# An agent that pushed its branch from a copy other than the project clone
+# leaves the head absent from a single-branch project clone: the refusal first
+# fetches the pull request's head branch there, then registers.
+test_pushed_head_branch_is_fetched_before_refusal() {
+  local dir sha
+  dir=$(make_case pushed-head-fetch)
+  git clone -q --bare "$dir/wt" "$dir/origin.git"
+  git clone -q --single-branch "$dir/origin.git" "$dir/project"
+  git -C "$dir/wt" commit -q --allow-empty -m 'pushed from the agent copy'
+  sha=$(git -C "$dir/wt" rev-parse HEAD)
+  git -C "$dir/wt" push -q "$dir/origin.git" HEAD:refs/heads/feature/login
+  fm_write_meta "$dir/home/state/task-a.meta" \
+    "window=firstmate:fm-task-a" "endpoint_task_id=task-a" "worktree=$dir/wt" \
+    "project=$dir/project" "kind=ship" "mode=direct-PR"
+  FM_TEST_GH_HEAD=unavailable FM_TEST_GH_HEAD_BRANCH=feature/login \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/4 > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "a head pushed to origin was refused: $(cat "$dir/stderr")"
+  [ "$(git -C "$dir/project" rev-parse --verify --quiet refs/remotes/origin/feature/login)" = "$sha" ] \
+    || fail "the PR head branch was not fetched into the project clone's remote-tracking ref"
+  grep -qx 'pr=https://github.com/o/r/pull/4' "$dir/home/state/task-a.meta" || fail "the PR was not recorded"
+  pass "fm-pr-check fetches the PR head branch into the project clone before refusing an unreachable head"
 }
 
 test_valid_recording_and_merge_derivation() {
@@ -3633,6 +3657,7 @@ test_draft_pull_request_is_not_armed
 test_secondmate_record_refuses_a_pr_watch
 test_unpushed_named_head_refuses_registration
 test_direct_pr_unpushed_commit_refuses_registration
+test_pushed_head_branch_is_fetched_before_refusal
 test_valid_recording_and_merge_derivation
 test_rejected_metacharacter_bytes_are_inert
 test_static_poll_contract

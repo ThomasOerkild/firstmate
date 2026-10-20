@@ -835,6 +835,18 @@ fm_dod_named_head_reachable_outside_worktree() {  # <worktree> <project> <mode> 
   [ "$mode" = local-only ] && fm_dod_ref_contains "$project" refs/heads "$sha"
 }
 
+# Fetches origin's <branch> into <project>'s refs/remotes/origin/<branch>, so a
+# head pushed from another copy becomes reachable in the project clone even when
+# that clone is single-branch. It writes that one ref and never deletes a ref.
+# 1 when <branch> is not a valid branch name or the fetch fails.
+fm_dod_fetch_origin_branch() {  # <project> <branch>
+  local project=$1 branch=$2
+  [ -n "$project" ] && [ -d "$project" ] && [ -n "$branch" ] || return 1
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 || return 1
+  GIT_TERMINAL_PROMPT=0 git -C "$project" fetch --quiet --no-tags origin \
+    "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1
+}
+
 # 0 when <line> is not a ship done: to gate, when the task's meta records
 # forge=external and fm_dod_accept_external_review_done accepts it, when it
 # names the task's recorded PR whose head the forge holds, when it names a

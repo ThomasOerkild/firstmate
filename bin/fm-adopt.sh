@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # Adopt an agent that already runs in a herdr pane firstmate did not start, so
 # firstmate supervises it like a spawned task.
-# Usage: fm-adopt.sh <task-id> --pane <herdr-pane-id> --project <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch <name>] [--session <herdr-session>] [--title <text>]
-#        fm-adopt.sh <task-id> --pane <herdr-pane-id> --project <project-dir> --kind scout [--session <herdr-session>] [--title <text>]
+# Usage: fm-adopt.sh <task-id> --pane <herdr-pane-id> --project <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch <name>] [--worktree <dir>] [--session <herdr-session>] [--title <text>]
+#        fm-adopt.sh <task-id> --pane <herdr-pane-id> --project <project-dir> --kind scout [--worktree <dir>] [--session <herdr-session>] [--title <text>]
 #   --kind defaults to ship. A ship takes the same explicit --mode and --yolo a
 #   ship spawn takes; --branch names the agent's existing branch and defaults
-#   to the branch checked out in the pane's directory.
+#   to the branch checked out in the task's git copy.
+#   --worktree is the git copy the agent works in, recorded as worktree=. When
+#   it is absent, the pane's directory is used if it is inside a git copy;
+#   otherwise the git copies one or two directory levels below it are searched
+#   for the one whose checked-out branch is --branch. None or several matches
+#   refuse and name --worktree.
 #   --session defaults to $HERDR_SESSION, else herdr's "default" session.
 #   --title is the backlog item's title and defaults to the pane's terminal title.
 # The live pane facts come from `herdr agent get`: workspace, tab, the agent's
-# harness label, and its working directory (foreground_cwd, else cwd).
+# harness label, and its pane directory (foreground_cwd, else cwd).
 # Refuses, before anything is written:
 #   - a pane herdr does not know, or one with no detected agent;
 #   - an agent label that is not a firstmate harness name;
 #   - firstmate's own pane: the supervisor pane (bin/fm-supervisor-target-lib.sh),
 #     this process's own herdr pane, or a pane whose directory is this home;
+#   - a git copy that cannot be resolved as described for --worktree;
 #   - a pane a task record in this home already names, or a task id that
 #     already has a record or a brief;
 #   - an automatic backlog whose backend is unavailable, or an existing
@@ -24,14 +30,18 @@
 #      rules, inbox, and Definition of done, with a Setup that keeps the
 #      agent's current work, directory, and branch.
 #   2. state/<id>.meta is published with the fields bin/fm-spawn.sh writes for
-#      a herdr task, worktree= set to the pane's directory, and adopted=1.
+#      a herdr task, worktree= set to the resolved git copy, and adopted=1.
 #      adopted=1 makes bin/fm-teardown.sh remove only firstmate's own records
 #      (never the directory, never the pane), makes bin/fm-spawn.sh --relaunch
 #      refuse, and lets bin/fm-busy-lib.sh read herdr's native idle, because no
 #      busy hooks are installed in a directory firstmate does not own.
 #   3. The backlog item is added when absent and moved to In flight through the
 #      same transition a spawn commits; a failure removes the record and brief.
-#   4. The worker role contract (bin/fm-dod-lib.sh) followed by the brief is
+#   4. A ship's branch is fetched from origin into the project clone's
+#      refs/remotes/origin/<branch> (bin/fm-dod-lib.sh fm_dod_fetch_origin_branch),
+#      so the ready-PR gate can see a head the agent pushed. A branch that is
+#      not on origin yet is reported and does not stop the adoption.
+#   5. The worker role contract (bin/fm-dod-lib.sh) followed by the brief is
 #      written once into the task's steering inbox, and bin/fm-send.sh types one
 #      line into the pane that names that record by its absolute path, because
 #      an adopted agent has no FM_TASK_INBOX in its environment.
@@ -83,11 +93,12 @@ KIND=ship
 MODE=
 YOLO=
 BRANCH=
+WORKTREE=
 SESSION=
 TITLE=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-  --pane | --project | --kind | --mode | --yolo | --branch | --session | --title)
+  --pane | --project | --kind | --mode | --yolo | --branch | --worktree | --session | --title)
     [ "$#" -ge 2 ] || die "$1 requires a value"
     case "$1" in
     --pane) PANE=$2 ;;
@@ -96,6 +107,7 @@ while [ "$#" -gt 0 ]; do
     --mode) MODE=$2 ;;
     --yolo) YOLO=$2 ;;
     --branch) BRANCH=$2 ;;
+    --worktree) WORKTREE=$2 ;;
     --session) SESSION=$2 ;;
     --title) TITLE=$2 ;;
     esac
@@ -149,10 +161,10 @@ pane_field() {
 WORKSPACE_ID=$(pane_field workspace_id)
 TAB_ID=$(pane_field tab_id)
 HARNESS=$(pane_field agent)
-WT=$(pane_field foreground_cwd)
-[ -n "$WT" ] || WT=$(pane_field cwd)
+PANE_DIR=$(pane_field foreground_cwd)
+[ -n "$PANE_DIR" ] || PANE_DIR=$(pane_field cwd)
 [ -n "$WORKSPACE_ID" ] && [ -n "$TAB_ID" ] || die "herdr returned no workspace or tab for pane $TARGET"
-[ -n "$WT" ] && [ -d "$WT" ] || die "pane $TARGET has no readable working directory (${WT:-none})"
+[ -n "$PANE_DIR" ] && [ -d "$PANE_DIR" ] || die "pane $TARGET has no readable working directory (${PANE_DIR:-none})"
 [ -n "$TITLE" ] || TITLE=$(pane_field terminal_title_stripped)
 [ -n "$TITLE" ] || TITLE="adopted herdr pane $TARGET"
 
@@ -164,7 +176,7 @@ esac
 OWN_TARGET=$(discover_supervisor_target 2>/dev/null) || OWN_TARGET=
 if [ "$TARGET" = "$OWN_TARGET" ] \
   || { [ -n "${HERDR_PANE_ID:-}" ] && [ "$TARGET" = "$(fm_backend_herdr_session):$HERDR_PANE_ID" ]; } \
-  || [ "$(cd "$WT" && pwd -P)" = "$(cd "$FM_HOME" 2>/dev/null && pwd -P)" ]; then
+  || [ "$(cd "$PANE_DIR" && pwd -P)" = "$(cd "$FM_HOME" 2>/dev/null && pwd -P)" ]; then
   die "pane $TARGET is firstmate's own pane"
 fi
 OWNER=$(fm_backend_meta_for_window "$TARGET" "$STATE" 2>/dev/null) || OWNER=
@@ -172,9 +184,33 @@ OWNER=$(fm_backend_meta_for_window "$TARGET" "$STATE" 2>/dev/null) || OWNER=
 [ ! -e "$STATE/$ID.meta" ] || die "task $ID already has a record at $STATE/$ID.meta"
 [ ! -e "$DATA/$ID/brief.md" ] || die "task $ID already has a brief at $DATA/$ID/brief.md"
 
+is_git_copy() {  # <dir>
+  git -C "$1" rev-parse --git-dir >/dev/null 2>&1
+}
+if [ -n "$WORKTREE" ]; then
+  WT=$(cd "$WORKTREE" 2>/dev/null && pwd -P) || die "--worktree directory not found: $WORKTREE"
+  is_git_copy "$WT" || die "--worktree $WT is not a git copy"
+elif is_git_copy "$PANE_DIR"; then
+  WT=$PANE_DIR
+else
+  [ -n "$BRANCH" ] || die "pane $TARGET's directory $PANE_DIR is not a git copy; pass --worktree <dir>$([ "$KIND" = scout ] || printf ', or --branch to search below it')"
+  MATCHES=()
+  for dir in "$PANE_DIR"/*/ "$PANE_DIR"/*/*/; do
+    dir=${dir%/}
+    [ -e "$dir/.git" ] || continue
+    [ "$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null)" = "$BRANCH" ] && MATCHES+=("$dir")
+  done
+  case "${#MATCHES[@]}" in
+  1) WT=$(cd "${MATCHES[0]}" && pwd -P) ;;
+  0) die "no git copy below $PANE_DIR has branch $BRANCH checked out; pass --worktree <dir>" ;;
+  *) die "several git copies below $PANE_DIR have branch $BRANCH checked out (${MATCHES[*]}); pass --worktree <dir>" ;;
+  esac
+fi
+[ "$(cd "$WT" && pwd -P)" != "$(cd "$FM_HOME" 2>/dev/null && pwd -P)" ] || die "$WT is firstmate's own home"
+
 if [ "$KIND" = ship ] && [ -z "$BRANCH" ]; then
   BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null) \
-    || die "pane $TARGET's directory $WT has no checked-out branch; pass --branch"
+    || die "$WT has no checked-out branch; pass --branch"
 fi
 
 BACKLOG_TRANSITION=0
@@ -294,6 +330,9 @@ done
 HELD_LOCKS=()
 
 echo "adopted $ID: pane $TARGET ($HARNESS) in $WT, kind=$KIND${MODE:+ mode=$MODE yolo=$YOLO branch=$BRANCH}"
+if [ "$KIND" = ship ] && ! fm_dod_fetch_origin_branch "$PROJ_ABS" "$BRANCH"; then
+  echo "note: branch $BRANCH could not be fetched from origin into $PROJ_ABS; the ready-PR check fetches it again" >&2
+fi
 POINTER=": Firstmate adopted this session as task $ID. Read $RECORD now and follow it, then mv it into its handled/ directory."
 send_rc=0
 FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-send.sh" "$TARGET" "$POINTER" >/dev/null || send_rc=$?

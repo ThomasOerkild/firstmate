@@ -4,6 +4,9 @@
 # Refuses when bin/fm-dod-lib.sh will not accept the named head as reachable
 # outside the worker's disposable copy; in no-mistakes mode a forge-reported
 # head is that named head and is already stored on the forge.
+# Before that refusal, a GitHub pull request's head branch is fetched from
+# origin into the project clone's refs/remotes/origin/<branch> and the gate is
+# asked once more (bin/fm-dod-lib.sh fm_dod_fetch_origin_branch).
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
 # A GitHub pull request URL, a GitLab merge request URL, and a Gerrit change URL
@@ -166,10 +169,21 @@ case "$PROVIDER:$MODE" in
   *:no-mistakes|*:) DONE_LINE="done: PR $URL checks green" ;;
   *) DONE_LINE="done: PR $URL" ;;
 esac
-if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; } \
-  && ! GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META"); then
-  echo "error: $GATE_REASON" >&2
-  exit 1
+# A head pushed from a copy other than the project clone is often absent from a
+# single-branch clone, so a refusal first fetches the pull request's head branch
+# into the clone's remote-tracking ref and asks the gate once more.
+gate_accepts() {
+  GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META")
+}
+if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; } && ! gate_accepts; then
+  HEAD_BRANCH=
+  if [ "$PROVIDER" = github ] && command -v gh >/dev/null 2>&1; then
+    HEAD_BRANCH=$(gh pr view "$URL" --json headRefName -q .headRefName 2>/dev/null) || HEAD_BRANCH=
+  fi
+  if [ -z "$HEAD_BRANCH" ] || ! fm_dod_fetch_origin_branch "$PROJECT" "$HEAD_BRANCH" || ! gate_accepts; then
+    echo "error: $GATE_REASON" >&2
+    exit 1
+  fi
 fi
 
 META_TMP=

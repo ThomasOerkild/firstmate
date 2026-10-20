@@ -191,7 +191,7 @@ test_adopt_refuses_before_writing_anything() {
   FAKE_HERDR_CWD="$dir/home/data" run_adopt "$dir" detached --pane w1:p1 --project "$dir/project" --mode local-only --yolo off \
     > /dev/null 2> "$dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || fail "fm-adopt adopted a ship with no branch to name"
-  assert_grep "pass --branch" "$dir/stderr" "a ship without a branch names the fix"
+  assert_grep "pass --worktree" "$dir/stderr" "a ship in a directory that is not a git copy names the fix"
   assert_nothing_adopted "$dir" detached "ship without a branch"
   pass "fm-adopt: a missing, agent-less, unknown, own, or owned pane is refused before anything is written"
 }
@@ -230,8 +230,96 @@ test_adopted_task_refuses_relaunch() {
   pass "fm-spawn: an adopted task refuses relaunch"
 }
 
+# A session directory that holds several clones of one origin: the agent's
+# branch is pushed to origin and checked out in session/brain only, while the
+# project clone is single-branch and has never seen it.
+make_session_case() {  # <name>
+  local dir
+  dir=$(make_case "$1")
+  git clone -q --bare "$dir/project" "$dir/origin.git"
+  rm -rf "$dir/project"
+  git clone -q --single-branch "$dir/origin.git" "$dir/project"
+  mkdir -p "$dir/session/tools"
+  git clone -q "$dir/origin.git" "$dir/session/brain"
+  git -C "$dir/session/brain" switch -q -c feature/login
+  git -C "$dir/session/brain" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m login
+  git -C "$dir/session/brain" push -q origin feature/login
+  git clone -q "$dir/origin.git" "$dir/session/api"
+  git clone -q "$dir/origin.git" "$dir/session/tools/web"
+  git -C "$dir/session/tools/web" switch -q -c feature/other
+  printf '%s\n' "$dir"
+}
+
+test_adopt_resolves_the_git_copy_below_a_session_directory() {
+  command -v tasks-axi >/dev/null 2>&1 || { pass "fm-adopt: session-directory adoption skipped (tasks-axi is not installed)"; return; }
+  local dir rc meta head
+  dir=$(make_session_case adopt-session)
+  meta="$dir/home/state/login-fix.meta"
+  head=$(git -C "$dir/session/brain" rev-parse HEAD)
+
+  rc=0
+  FAKE_HERDR_CWD="$dir/session" run_adopt "$dir" login-fix --pane w1:p1 --project "$dir/project" \
+    --mode direct-PR --yolo off --branch feature/login > /dev/null 2> "$dir/stderr" || rc=$?
+  expect_code 0 "$rc" "fm-adopt: adopting a pane in a session directory ($(cat "$dir/stderr"))"
+  assert_equals "$dir/session/brain" "$(fm_meta_get "$meta" worktree)" "the record's worktree is the one clone on the agent's branch"
+  assert_equals "$head" "$(git -C "$dir/project" rev-parse --verify --quiet refs/remotes/origin/feature/login)" \
+    "the agent's pushed branch is fetched into the project clone's remote-tracking ref"
+  assert_present "$dir/session/brain/.git" "the adopted git copy is untouched"
+  pass "fm-adopt: a session directory resolves to the one clone on the branch, and the branch is fetched"
+
+  dir=$(make_session_case adopt-explicit)
+  meta="$dir/home/state/web.meta"
+  rc=0
+  FAKE_HERDR_CWD="$dir/session" run_adopt "$dir" web --pane w1:p1 --project "$dir/project" \
+    --mode direct-PR --yolo off --worktree "$dir/session/tools/web" > /dev/null 2> "$dir/stderr" || rc=$?
+  expect_code 0 "$rc" "fm-adopt: adopting with --worktree ($(cat "$dir/stderr"))"
+  assert_equals "$dir/session/tools/web" "$(fm_meta_get "$meta" worktree)" "--worktree is recorded as the worktree"
+  assert_equals "feature/other" "$(fm_meta_get "$meta" branch)" "the branch defaults to the --worktree copy's branch"
+  assert_grep "could not be fetched" "$dir/stderr" "a branch absent from origin is reported"
+  pass "fm-adopt: --worktree names the git copy and a branch absent from origin does not stop the adoption"
+}
+
+test_adopt_refuses_an_unresolvable_git_copy() {
+  local dir rc
+  dir=$(make_session_case adopt-session-refusals)
+
+  rc=0
+  FAKE_HERDR_CWD="$dir/session" run_adopt "$dir" nobranch --pane w1:p1 --project "$dir/project" \
+    --mode direct-PR --yolo off --branch feature/missing > /dev/null 2> "$dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-adopt adopted a session directory with no clone on the branch"
+  assert_grep "no git copy below" "$dir/stderr" "no matching clone names the reason"
+  assert_grep "pass --worktree" "$dir/stderr" "no matching clone names --worktree"
+  assert_nothing_adopted "$dir" nobranch "no matching clone"
+
+  git -C "$dir/session/api" switch -q -c feature/login
+  rc=0
+  FAKE_HERDR_CWD="$dir/session" run_adopt "$dir" twice --pane w1:p1 --project "$dir/project" \
+    --mode direct-PR --yolo off --branch feature/login > /dev/null 2> "$dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-adopt chose between two clones on the same branch"
+  assert_grep "several git copies" "$dir/stderr" "several matching clones name the reason"
+  assert_grep "pass --worktree" "$dir/stderr" "several matching clones name --worktree"
+  assert_nothing_adopted "$dir" twice "several matching clones"
+
+  rc=0
+  FAKE_HERDR_CWD="$dir/session" run_adopt "$dir" scout --pane w1:p1 --project "$dir/project" --kind scout \
+    > /dev/null 2> "$dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-adopt adopted a scout whose directory is not a git copy"
+  assert_grep "pass --worktree" "$dir/stderr" "a scout outside a git copy names --worktree"
+  assert_nothing_adopted "$dir" scout "scout outside a git copy"
+
+  rc=0
+  run_adopt "$dir" notgit --pane w1:p1 --project "$dir/project" --kind scout --worktree "$dir/session" \
+    > /dev/null 2> "$dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-adopt accepted a --worktree that is not a git copy"
+  assert_grep "is not a git copy" "$dir/stderr" "a --worktree that is not a git copy names the reason"
+  assert_nothing_adopted "$dir" notgit "--worktree that is not a git copy"
+  pass "fm-adopt: a git copy that is missing, ambiguous, or not git is refused before anything is written"
+}
+
 test_adopt_records_the_pane_and_delivers_the_contract
 test_adopt_refuses_before_writing_anything
+test_adopt_resolves_the_git_copy_below_a_session_directory
+test_adopt_refuses_an_unresolvable_git_copy
 test_adopt_stops_when_the_backlog_backend_is_unavailable
 test_adopted_task_refuses_relaunch
 
