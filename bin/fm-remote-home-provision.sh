@@ -17,7 +17,8 @@
 # reply promise, which the subsystem can only carry on the parent's own
 # filesystem, is never mistaken for one this child could hold - and the
 # .fm-secondmate-home marker commits the complete seed last.
-# A newly created home is removed on failure. An existing matching seeded home
+# A home path that holds only empty operational directories is provisioned as
+# absent. A newly created home is removed on failure. An existing matching seeded home
 # is converged only through guarded ordinary-file updates and new project clones.
 set -eu
 
@@ -149,6 +150,30 @@ PROVISION_LOCK="$STATE/.remote-home-provision-$HOME_LOCK_KEY.lock"
 fm_lock_acquire_wait "$PROVISION_LOCK"
 PROVISION_LOCK_HELD=1
 
+# True when the home is a real directory that holds nothing but empty data,
+# state, config, or projects directories, such as an interrupted attempt
+# leaves. Any other entry is real content.
+home_is_empty_husk() {
+  local entry
+  [ -d "$FM_HOME" ] && [ ! -L "$FM_HOME" ] || return 1
+  for entry in "$FM_HOME"/* "$FM_HOME"/.[!.]* "$FM_HOME"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    case "${entry##*/}" in data|state|config|projects) ;; *) return 1 ;; esac
+    [ -d "$entry" ] && [ ! -L "$entry" ] || return 1
+    [ -z "$(ls -A -- "$entry")" ] || return 1
+  done
+}
+
+# Remove an empty husk so the home is provisioned as absent. rmdir refuses a
+# directory that gained content, so a racing writer is never discarded.
+if home_is_empty_husk; then
+  for operational_dir in data state config projects; do
+    [ ! -d "$FM_HOME/$operational_dir" ] || rmdir -- "$FM_HOME/$operational_dir" \
+      || die "cannot clear empty remote operational directory: $operational_dir"
+  done
+  rmdir -- "$FM_HOME" || die "cannot clear empty remote home"
+fi
+
 if [ -e "$FM_HOME" ] || [ -L "$FM_HOME" ]; then
   [ -d "$FM_HOME" ] && [ ! -L "$FM_HOME" ] || die "remote home exists but is not a safe directory"
   [ -f "$FM_HOME/AGENTS.md" ] && [ ! -L "$FM_HOME/AGENTS.md" ] \
@@ -205,6 +230,8 @@ for operational_dir in data state config projects; do
   if [ -e "$operational_path" ] || [ -L "$operational_path" ]; then
     [ -d "$operational_path" ] && [ ! -L "$operational_path" ] \
       || die "remote home has unsafe operational directory: $operational_dir"
+  elif [ "$operational_dir" = state ]; then
+    mkdir -m 700 "$operational_path" || die "cannot create remote operational directory: $operational_dir"
   else
     mkdir "$operational_path" || die "cannot create remote operational directory: $operational_dir"
   fi

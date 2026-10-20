@@ -17,6 +17,7 @@
 #                 "BACKLOG_RECONCILE: <id>: <what this home could not reconcile>",
 #                 "BACKLOG_RECONCILE: code-root <file> is not this home's <file>; ...",
 #                 "TANGLE: <remediation>",
+#                 "STATE_ROOT: <path> <why it is not private> - <fix>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
@@ -1507,6 +1508,7 @@ detect_local_config() {
       echo "TANGLE: primary checkout on feature branch '$tangle_branch' (expected '$tangle_default'); the work is safe on that ref - restore the primary with: git -C $FM_ROOT checkout $tangle_default, then re-validate the branch in a proper worktree"
     fi
   fi
+  detect_state_root_private
   crew=
   [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then
@@ -1527,6 +1529,28 @@ detect_local_config() {
   fi
   detect_code_root_backlog_fork
   detect_home_summary_publication
+}
+
+# Private state-root check. Process-event sources refuse a state root that is
+# not a directory owned by this user without group or other write access
+# (fm_procevent_state_root_resolve), so report it here with its fix rather than
+# at the first source arm. Detect-only: the mode is the operator's to change.
+detect_state_root_private() {
+  local canonical
+  [ -e "$STATE" ] || [ -L "$STATE" ] || return 0
+  # shellcheck source=bin/fm-pr-lib.sh disable=SC1091
+  . "$SCRIPT_DIR/fm-pr-lib.sh"
+  # shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  # shellcheck source=bin/fm-procevent-lib.sh disable=SC1091
+  . "$SCRIPT_DIR/fm-procevent-lib.sh"
+  fm_procevent_state_root_resolve "$STATE" >/dev/null && return 0
+  canonical=$(CDPATH='' cd -P -- "$STATE" 2>/dev/null && pwd -P) || canonical=$STATE
+  if [ -d "$canonical" ] && fm_procevent_directory_owned_by_current_user "$canonical"; then
+    echo "STATE_ROOT: $canonical is writable by group or others, so process-event sources refuse it - fix with: chmod 700 $canonical"
+  else
+    echo "STATE_ROOT: $STATE is not a directory owned by this user, so process-event sources refuse it - replace it with a private directory owned by this user"
+  fi
 }
 
 # Shadow-backlog check. When this home's data directory is not the code root's,

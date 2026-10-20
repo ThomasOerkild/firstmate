@@ -91,7 +91,7 @@ stand_down() {
 # without mistaking it for a failed eligible attempt that needs the manual nudge.
 fm_is_gate_agent "$FM_ROOT" && stand_down
 if [ ! -d "$STATE" ] && fm_primary_root_matches "$FM_ROOT"; then
-  if ! MKDIR_ERR=$(mkdir -p "$STATE" 2>&1); then
+  if ! MKDIR_ERR=$(umask 077; mkdir -p "$STATE" 2>&1); then
     printf 'fm-sessionstart-run: startup could not create the state directory %s: %s\n' \
       "$STATE" "${MKDIR_ERR##*: }" >&2
     stand_down

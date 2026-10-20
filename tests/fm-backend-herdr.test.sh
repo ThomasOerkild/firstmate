@@ -61,6 +61,9 @@ if [ "${1:-}" = status ] && [ "${2:-}" = --json ] && [ "${FM_HERDR_SCRIPT_STATUS
   printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
   exit 0
 fi
+# The server launch runs in the background and races the caller's next call,
+# so it takes no response slot.
+[ "${1:-}" = server ] && exit 0
 if [ "${1:-}" = terminal ] && [ "${2:-}" = title ] && [ "${3:-}" = clear ]; then
   reason=${FM_FAKE_HERDR_FOREGROUND_REASON:-no_foreground_client}
   printf '{"result":{"reason":"%s"}}\n' "$reason"
@@ -159,6 +162,31 @@ case "${1:-}" in
       printf 'args=%s\n' "$*"
     } > "$FM_HERDR_SERVER_ENV_LOG"
     : > "$FM_HERDR_SERVER_MARKER"
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+make_herdr_detach_fakebin() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  status)
+    if [ -s "$FM_HERDR_SERVER_MARKER" ]; then
+      printf '{"server":{"running":true}}\n'
+    else
+      printf '{"server":{"running":false}}\n'
+    fi
+    ;;
+  server)
+    ls /dev/fd > "$FM_HERDR_SERVER_FDS" 2>/dev/null
+    printf '%s\n' "$$" > "$FM_HERDR_SERVER_MARKER"
+    exec sleep 30
     ;;
 esac
 SH
@@ -1192,18 +1220,23 @@ test_container_ensure_starts_server_and_workspace() {
   printf '{"client":{"version":"0.7.1","protocol":14}}\n' > "$resp/1.out"
   # 2: server_ensure's status --json check -> not running
   printf '{"server":{"running":false}}\n' > "$resp/2.out"
-  # 3: `herdr server` backgrounded launch - no meaningful output
-  # 4: server_ensure poll -> now running
-  printf '{"server":{"running":true}}\n' > "$resp/4.out"
-  # 5: workspace list -> empty (no "firstmate" workspace yet)
-  printf '{"result":{"workspaces":[]}}\n' > "$resp/5.out"
-  # 6: workspace create -> w1, seeding default tab w1:t9 (real herdr returns
+  # The backgrounded `herdr server` launch takes no response slot.
+  # 3: server_ensure poll -> now running
+  printf '{"server":{"running":true}}\n' > "$resp/3.out"
+  # 4: workspace list -> empty (no "firstmate" workspace yet)
+  printf '{"result":{"workspaces":[]}}\n' > "$resp/4.out"
+  # 5: workspace create -> w1, seeding default tab w1:t9 (real herdr returns
   # the seeded tab/pane ids in the SAME response - verified empirically).
-  printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"},"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' > "$resp/6.out"
+  printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"},"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' > "$resp/5.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 HERDR_SESSION=fmtest \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" )
   [ "$out" = $'fmtest:w1\tw1:t9' ] || fail "container_ensure should echo '<session>:<workspace_id>\\t<seeded_default_tab_id>', got '$out'"
+  # The detached server launch can log after container_ensure returns.
+  for _ in $(seq 1 50); do
+    grep -q "HERDR_SESSION=fmtest"$'\x1f''server' "$log" && break
+    sleep 0.1
+  done
   assert_contains "$(cat "$log")" "HERDR_SESSION=fmtest"$'\x1f''server' "container_ensure did not start the herdr server"
   assert_contains "$(cat "$log")" $'\x1f''workspace'$'\x1f''create'$'\x1f''--cwd'$'\x1f''/tmp'$'\x1f''--label'$'\x1f''firstmate' \
     "container_ensure did not create the firstmate workspace with the given cwd"
@@ -1229,6 +1262,32 @@ test_server_ensure_scrubs_home_and_harness_identity() {
   assert_contains "$output" "HERDR_SESSION=fmtest" "server_ensure lost explicit Herdr session routing"
   assert_contains "$output" "args=server --session fmtest" "server_ensure lost the trailing Herdr session flag"
   pass "fm_backend_herdr_server_ensure: scrubs home and harness identity without disturbing unrelated environment or session routing"
+}
+
+test_server_ensure_detaches_from_caller_group_and_descriptors() {
+  local dir marker fds fb caller server
+  dir="$TMP_ROOT/server-detach"; mkdir -p "$dir"; marker="$dir/server.pid"; fds="$dir/fds"
+  fb=$(make_herdr_detach_fakebin "$dir")
+  # The remote job worker runs each command in its own process group and waits
+  # until that whole group is gone; model it with job control and an extra
+  # inherited descriptor.
+  set -m
+  ( PATH="$fb:$PATH" FM_HERDR_SERVER_MARKER="$marker" FM_HERDR_SERVER_FDS="$fds" \
+      exec bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" 7>"$dir/held" ) &
+  caller=$!
+  set +m
+  wait "$caller"
+  expect_code 0 $? "server_ensure should start the server"
+  server=$(cat "$marker")
+  kill -0 "$server" 2>/dev/null || fail "the started server did not outlive its launcher"
+  if kill -0 -- "-$caller" 2>/dev/null; then
+    kill "$server" 2>/dev/null
+    fail "the started server stayed in the caller's process group, so a group wait blocks on it"
+  fi
+  kill "$server" 2>/dev/null
+  [ -s "$fds" ] || fail "the fake server did not record its descriptors"
+  ! grep -qx 7 "$fds" || fail "the started server inherited the caller's descriptor 7"
+  pass "fm_backend_herdr_server_ensure: detaches the server from the caller's process group and descriptors"
 }
 
 test_container_ensure_reuses_existing_workspace() {
@@ -6002,6 +6061,7 @@ test_workspace_ensure_other_home_ignores_the_launcher_identity
 test_container_ensure_refuses_an_ambiguous_home_label
 test_container_ensure_starts_server_and_workspace
 test_server_ensure_scrubs_home_and_harness_identity
+test_server_ensure_detaches_from_caller_group_and_descriptors
 test_container_ensure_reuses_existing_workspace
 test_container_ensure_creates_with_no_focus_flag
 test_container_ensure_uses_secondmate_home_label

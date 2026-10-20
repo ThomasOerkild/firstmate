@@ -433,6 +433,36 @@ wait "$provision_two" || fail "reconciled provisioning attempt failed"
   || fail "reconciled provisioning cloned the already-published home"
 pass "overlapping remote home provisioning serializes through publication and rollback"
 
+# An interrupted attempt can leave the home path holding only empty operational
+# directories; a retry provisions it as absent, while any real content still
+# refuses.
+mkdir -p "$TMP_ROOT/husk-home/state" "$TMP_ROOT/husk-home/data"
+PATH="$FAKEBIN:$PATH" FM_HOME="$TMP_ROOT/husk-home" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+  "$REMOTE_ROOT/bin/fm-remote-home-provision.sh" < "$TMP_ROOT/provision.manifest" \
+  > "$TMP_ROOT/husk-provision.out" 2>&1 \
+  || { sed 's/^/husk-provision: /' "$TMP_ROOT/husk-provision.out"; fail "provisioning refused a home holding only empty operational directories"; }
+if [ "$(cat "$TMP_ROOT/husk-home/.fm-secondmate-home")" != ios ] \
+  || ! cmp -s "$REMOTE_ROOT/AGENTS.md" "$TMP_ROOT/husk-home/AGENTS.md"; then
+  fail "provisioning over an empty husk did not publish a complete home"
+fi
+husk_state_mode=$(stat -c %a "$TMP_ROOT/husk-home/state" 2>/dev/null || stat -f %Lp "$TMP_ROOT/husk-home/state")
+[ "$husk_state_mode" = 700 ] || fail "provisioning created the remote state root with mode $husk_state_mode, not 700"
+for husk_content in state/stray foreign; do
+  rm -rf -- "$TMP_ROOT/foreign-husk-home"
+  mkdir -p "$TMP_ROOT/foreign-husk-home/state"
+  printf 'keep\n' > "$TMP_ROOT/foreign-husk-home/$husk_content"
+  if PATH="$FAKEBIN:$PATH" FM_HOME="$TMP_ROOT/foreign-husk-home" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    "$REMOTE_ROOT/bin/fm-remote-home-provision.sh" < "$TMP_ROOT/provision.manifest" \
+    > "$TMP_ROOT/foreign-husk-provision.out" 2>&1; then
+    fail "provisioning adopted a home path holding $husk_content"
+  fi
+  grep -qF "existing remote home is not a safe Firstmate checkout" "$TMP_ROOT/foreign-husk-provision.out" \
+    || { sed 's/^/foreign-husk-provision: /' "$TMP_ROOT/foreign-husk-provision.out"; fail "a home holding $husk_content was refused for the wrong reason"; }
+  [ "$(cat "$TMP_ROOT/foreign-husk-home/$husk_content")" = keep ] \
+    || fail "provisioning altered a home path holding $husk_content"
+done
+pass "remote home provisioning treats an empty operational-directory husk as absent, creates a private state root, and still refuses real content"
+
 # A competing cleanup aimed at the public home path must never reach a clone
 # that is still being written: the home clone is staged privately and published
 # by rename, so the racing rm -rf finds only an absent path.
