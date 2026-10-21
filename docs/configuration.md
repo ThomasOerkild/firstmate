@@ -572,6 +572,14 @@ A Secondmate on a remote route is covered the same way: the primary resolves and
 The presence flag is session-scoped enablement, so it transfers at launch and is left unchanged by live convergence into a running home.
 See [`trace-context.md`](trace-context.md) for carrier semantics, supported routes, the manual fleet-restart requirement, the session boundary, and safety limits; `bin/fm-trace-context-lib.sh`'s header owns the exact mechanics, and [`verification/trace-context.md`](verification/trace-context.md) records repeatable evidence.
 
+## PR hygiene (config/no-pr-hygiene)
+
+PR hygiene is on by default for every recorded GitHub task PR, with no extra step: the merge poll that `bin/fm-pr-check.sh` arms also reads unresolved review threads, merge conflicts, failing required checks, and a branch behind a base that requires up-to-date branches, in the same single GraphQL read per poll.
+A finding from a review bot or the forge goes once per new state to the task's own worker as a steer to run make-it-green; review from people, a worker that is gone, or a steer that cannot be recorded wakes firstmate instead.
+Draft PRs, persistent secondmate records, and GitLab, Gerrit, and Forgejo changes get no hygiene, and nothing is ever merged or answered on a person's behalf.
+The optional local, gitignored `config/no-pr-hygiene` presence flag turns the feature off for this home; merge detection is unchanged.
+`bin/fm-pr-poll.sh` owns the finding format and `bin/fm-pr-hygiene.sh` owns dedup and routing.
+
 ## Fleet activity ledger (config/fleet-ledger)
 
 See [`fleet-ledger.md`](fleet-ledger.md) for the opt-in setup, record contract, and limits.

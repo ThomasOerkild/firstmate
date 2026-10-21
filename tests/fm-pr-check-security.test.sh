@@ -27,6 +27,8 @@ REAL_CHMOD=$(command -v chmod)
 # deliberately restricted, so a case that needs jq exposes this one rather than
 # depending on the host keeping jq in one of those four directories.
 REAL_JQ=$(command -v jq) || fail "these tests read glab's JSON with the real jq, which was not found"
+# The fake gh runs the PR poll's own --jq program with this jq.
+export FM_TEST_REAL_JQ="$REAL_JQ"
 
 ack_watcher_cycle() {  # <state>
   local state=$1 err sequence generation
@@ -139,6 +141,25 @@ SH
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
+case "${1:-} ${2:-} $*" in
+  "api graphql "*reviewThreads*)
+    # The PR poll's one GraphQL read: run its own --jq program on a fixture.
+    [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
+    [ -z "${FM_TEST_GH_STATE_STARTED:-}" ] || : > "$FM_TEST_GH_STATE_STARTED"
+    [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
+    program=
+    while [ "$#" -gt 0 ]; do
+      [ "$1" != --jq ] || program=$2
+      shift
+    done
+    if [ -n "${FM_TEST_GH_PR_JSON:-}" ]; then
+      "$FM_TEST_REAL_JQ" -r "$program" "$FM_TEST_GH_PR_JSON"
+    else
+      "$FM_TEST_REAL_JQ" -nr --arg state "${FM_TEST_GH_STATE:-OPEN}" '{data:{viewer:{login:"me"},repository:{pullRequest:{state:$state,isDraft:false,mergeable:"MERGEABLE",mergeStateStatus:"CLEAN",headRefOid:"0123456789abcdef0123456789abcdef01234567",author:{login:"me"},reviewThreads:{nodes:[]},latestReviews:{nodes:[]},comments:{nodes:[]},commits:{nodes:[]}}}}}' | "$FM_TEST_REAL_JQ" -r "$program"
+    fi
+    exit 0
+    ;;
+esac
 case "${1:-} ${2:-}" in
   "api graphql")
     printf '%s\n' \
@@ -1507,6 +1528,7 @@ test_teardown_removes_poll_artifacts() {
   printf 'data\n' > "$dir/home/state/task-a.pr-poll"
   printf 'registration\n' > "$dir/home/state/task-a.pr-poll-registration"
   printf 'trust\n' > "$dir/home/state/task-a.check-trust"
+  printf 'head=\n' > "$dir/home/state/task-a.pr-hygiene"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -1521,6 +1543,7 @@ SH
   [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "teardown left the sidecar"
   [ ! -e "$dir/home/state/task-a.pr-poll-registration" ] || fail "teardown left the PR poll registration"
   [ ! -e "$dir/home/state/task-a.check-trust" ] || fail "teardown left the custom check registration"
+  [ ! -e "$dir/home/state/task-a.pr-hygiene" ] || fail "teardown left the PR hygiene record"
 
   dir=$(make_case teardown-retirement-receipt)
   fakebin="$dir/fakebin"
@@ -2314,6 +2337,42 @@ poll_artifact_snapshot() {
       printf 'other %s\n' "$suffix"
     fi
   done
+}
+
+test_hygiene_finding_wakes_once_through_the_watcher() {
+  local dir state rc
+  dir=$(make_case hygiene-watch)
+  state="$dir/home/state"
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/1 kind=ship
+  seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/1
+  add_stop_custom_check "$dir"
+  "$REAL_JQ" -n '{data: {viewer: {login: "me"}, repository: {pullRequest: {
+    state: "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+    headRefOid: "0123456789abcdef0123456789abcdef01234567", author: {login: "me"},
+    reviewThreads: {nodes: []}, comments: {nodes: []}, commits: {nodes: []},
+    latestReviews: {nodes: [{databaseId: 60, state: "CHANGES_REQUESTED", author: {__typename: "User", login: "reviewer"}}]}}}}}' \
+    > "$dir/pr.json"
+
+  set +e
+  FM_TEST_GH_PR_JSON="$dir/pr.json" run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch-1.out" 2> "$dir/watch-1.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "hygiene watcher cycle failed: $(cat "$dir/watch-1.err")"
+  case "$(cat "$dir/watch-1.out")" in
+    "check: $state/task-a.check.sh: pr-hygiene https://github.com/o/r/pull/1 has review from people for the captain: 1 changes-requested review(s) from people") ;;
+    *) fail "human review did not wake firstmate through the watcher: $(cat "$dir/watch-1.out")" ;;
+  esac
+  ack_watcher_cycle "$state" || fail "hygiene wake acknowledgement failed"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_PR_JSON="$dir/pr.json" run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch-2.out" 2> "$dir/watch-2.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "second hygiene watcher cycle failed: $(cat "$dir/watch-2.err")"
+  case "$(cat "$dir/watch-2.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "an unchanged hygiene state woke firstmate again: $(cat "$dir/watch-2.out")" ;; esac
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" || fail "a hygiene finding disarmed the merge poll"
+  pass "a PR hygiene finding wakes through the watcher once and keeps the merge poll armed"
 }
 
 test_merged_poll_retires_once() {
@@ -3396,7 +3455,7 @@ SH
     || fail "re-recorded registration differs from the one published on the live device"
   [ "$(file_mode "$state/task-a.pr-poll-registration")" = 600 ] || fail "re-recorded registration is not private"
   fm_pr_poll_artifacts_valid "$state" task-a "$POLL" || fail "re-recorded poll is not strictly authenticated"
-  grep -F 'pr view https://github.com/o/r/pull/1 --json state' "$dir/gh.log" >/dev/null \
+  grep -F -- '-f owner=o -f name=r -F number=1 --jq' "$dir/gh.log" >/dev/null \
     || fail "re-recorded poll did not run its validated check in the same cycle"
   grep -F 're-recorded PR poll identity for task-a' "$state/.watch-triage.log" >/dev/null \
     || fail "re-record left no triage evidence"
@@ -3483,7 +3542,7 @@ SH
     esac
     [ "$(fm_pr_sha256 "$state/task-a.pr-poll-registration")" = "$registration_sha" ] \
       || fail "$mutation let the watcher re-record the registration"
-    ! grep -F -- '--json state' "$dir/gh.log" >/dev/null 2>&1 \
+    ! grep -F -- 'api graphql --hostname github.com' "$dir/gh.log" >/dev/null 2>&1 \
       || fail "$mutation ran the refused poll"
     ! ls "$state"/.fm-pr-poll-registration.* >/dev/null 2>&1 \
       || fail "$mutation left a staged registration behind"
@@ -3635,6 +3694,7 @@ test_gerrit_arming_records_no_patch_set_revision
 test_gerrit_ready_gate_reads_the_published_tree
 test_gerrit_nm_ready_gate_requires_recovered_custody
 test_merged_poll_retires_once
+test_hygiene_finding_wakes_once_through_the_watcher
 test_merged_poll_reregistration_after_notification_is_absorbed
 test_merged_poll_retries_a_failed_upward_report
 test_self_merge_and_poll_publish_one_outcome

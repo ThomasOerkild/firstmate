@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Static watcher program for a validated pull request, merge request, or Gerrit
 # change poll sidecar.
-# It emits exactly one merged line for a merged change and stays silent
-# otherwise, including on every error, so a failed lookup can never be read as
-# a merge. The provider-tagged identity is data in the sidecar and is never
+# It emits exactly one merged line for a merged change, one hygiene line for an
+# open GitHub pull request that needs make-it-green work (format below), and
+# stays silent otherwise, including on every error, so a failed lookup can
+# never be read as a merge or a finding. The provider-tagged identity is data in the sidecar and is never
 # interpolated into this source: these bytes are identical for every task.
 # Each provider is read through its own standard CLI, gh for GitHub, glab for
 # GitLab, gerrit-axi for Gerrit, and tea for Forgejo, so an upstream checkout
@@ -66,8 +67,80 @@ case "$provider" in
       .|..|*[!A-Za-z0-9._-]*) exit 0 ;;
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
-    state=$(gh pr view "$url" --json state -q .state 2>/dev/null) || exit 0
-    [ "$state" = MERGED ] && printf '%s\n' merged
+    # One GraphQL read per poll returns the merge state and the PR hygiene
+    # findings that bin/fm-pr-hygiene.sh turns into a worker steer or a wake.
+    # gh's built-in jq reduces the record to one line: "merged", nothing for a
+    # clean, draft, or closed PR, or
+    #   hygiene head=<sha> work=<tokens|-> human=<tokens|->
+    # work tokens are threads:<n>@<newest-id> (unresolved review-bot threads
+    # whose last comment is not ours), conflict, checks:<n> (failing required
+    # checks on the head, or failing checks when none is required), and behind
+    # (GitHub reports BEHIND only when the base requires up-to-date branches).
+    # human tokens are threads:, changes: (changes-requested reviews), and
+    # comments: (conversation comments after our last one), all from people.
+    # "Ours" means the authenticated viewer or the PR author.
+    out=$(gh api graphql --hostname github.com -f query="$(cat <<'GRAPHQL'
+query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state isDraft mergeable mergeStateStatus headRefOid
+      author { login }
+      reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { databaseId author { __typename login } } } } }
+      latestReviews(first: 50) { nodes { databaseId state author { __typename login } } }
+      comments(last: 30) { nodes { databaseId author { __typename login } } }
+      commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
+        __typename
+        ... on CheckRun { conclusion isRequired(pullRequestNumber: $number) }
+        ... on StatusContext { state isRequired(pullRequestNumber: $number) }
+      } } } } } }
+    }
+  }
+}
+GRAPHQL
+)" -f owner="$owner" -f name="$repo" -F number="$number" --jq "$(cat <<'JQ'
+def who($us):
+  if type != "object" then "none"
+  elif .__typename == "Bot" or ((.login // "") | endswith("[bot]")) then "bot"
+  elif .__typename == "User" and (.login as $l | any($us[]; . == $l) | not) then "human"
+  else "none" end;
+def token($name): if length == 0 then empty else "\($name):\(length)@\(map(.databaseId // 0) | max)" end;
+def joined: if length == 0 then "-" else join(",") end;
+.data as $d | ($d.repository.pullRequest // null) as $p
+| if $p == null then empty
+  elif $p.state == "MERGED" then "merged"
+  elif $p.state != "OPEN" or $p.isDraft != false then empty
+  else
+    ([$d.viewer.login, $p.author.login] | map(select(type == "string"))) as $us
+    | [$p.reviewThreads.nodes[] | select(.isResolved == false) | .comments.nodes[-1]
+       | select(type == "object") | . + {who: (.author | who($us))}] as $threads
+    | ($p.comments.nodes) as $c
+    | ([range(0; $c | length) | select(($c[.].author.login // null) as $l | any($us[]; . == $l))] | max // -1) as $answered
+    | ($p.commits.nodes[0].commit // {}) as $commit
+    | (if $commit.oid == $p.headRefOid then ($commit.statusCheckRollup.contexts.nodes // []) else [] end) as $ctx
+    | ([$ctx[] | select(.isRequired == true)]) as $required
+    | ([(if ($required | length) > 0 then $required else $ctx end)[]
+        | select((.__typename == "CheckRun" and (.conclusion as $x | ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"] | any(. == $x)))
+              or (.__typename == "StatusContext" and (.state as $x | ["FAILURE", "ERROR"] | any(. == $x))))] | length) as $failing
+    | ([([$threads[] | select(.who == "bot")] | token("threads")),
+        (if $p.mergeable == "CONFLICTING" or $p.mergeStateStatus == "DIRTY" then "conflict" else empty end),
+        (if $failing > 0 then "checks:\($failing)" else empty end),
+        (if $p.mergeStateStatus == "BEHIND" then "behind" else empty end)]) as $work
+    | ([([$threads[] | select(.who == "human")] | token("threads")),
+        ([$p.latestReviews.nodes[] | select(.state == "CHANGES_REQUESTED" and (.author | who($us)) == "human")] | token("changes")),
+        ([$c[($answered + 1):][] | select((.author | who($us)) == "human")] | token("comments"))]) as $human
+    | if ($work | length) + ($human | length) == 0 then empty
+      else "hygiene head=\($p.headRefOid) work=\($work | joined) human=\($human | joined)" end
+  end
+JQ
+)" 2>/dev/null) || exit 0
+    token='[a-z]+(:[0-9]+(@[0-9]+)?)?'
+    list="(-|$token(,$token)*)"
+    if [ "$out" = merged ]; then
+      printf '%s\n' merged
+    elif [[ $out =~ ^hygiene\ head=[0-9a-f]{40}\ work=$list\ human=$list$ ]]; then
+      printf '%s\n' "$out"
+    fi
     ;;
   gitlab)
     [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || exit 0

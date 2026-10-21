@@ -3034,6 +3034,21 @@ EOF
             continue
           fi
         fi
+        # A hygiene line steers the task's worker through bin/fm-pr-hygiene.sh,
+        # which owns dedup and prints a reason only when firstmate must act.
+        if [ "$is_pr_poll" -eq 1 ] && [ "${out%% *}" = hygiene ]; then
+          pr_poll_control_release || exit 1
+          hygiene_reason=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG \
+            "$SCRIPT_DIR/fm-pr-hygiene.sh" "$id" "$url" "$out" 2>/dev/null) \
+            || hygiene_reason="pr-hygiene $url could not be processed"
+          if [ -n "$hygiene_reason" ]; then
+            reason="check: $c: $hygiene_reason"
+            fm_wake_append check "$c" "$reason" || exit 1
+            touch "$STATE/.last-check"
+            wake "$reason"
+          fi
+          continue
+        fi
         reason="check: $c: $out"
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           if [ "$(fm_meta_get "$STATE/$id.meta" kind)" = secondmate ]; then
