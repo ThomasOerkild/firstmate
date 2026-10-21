@@ -3295,7 +3295,7 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 # (Enter only, never retyped) until native agent-state, a cleared composer, or
 # fm_composer_queued_enter_verdict confirms delivery. When native identity is
 # Claude, text is typed only into an empty composer and Enter is sent only
-# after the composer shows the payload (fm_backend_herdr_composer_payload_shown).
+# after the composer shows the payload (fm_backend_herdr_composer_payload_wait).
 # A missing read, a shorter suffix, or a paste placeholder followed by a
 # literal remainder does not press Enter: the composer is cleared back to
 # empty and the verdict is send-failed, or unknown when the clear cannot be
@@ -3450,12 +3450,8 @@ fm_backend_herdr_composer_content() {  # <target>
 # remainder, is the head-truncation shape and is not proof.
 fm_backend_herdr_composer_payload_shown() {  # <text> <after>
   local text=$1 after=$2 literal
-  fm_composer_normalize_spaces_var text
-  fm_composer_normalize_spaces_var after
-  text=${text//[$' \t\r\n\v\f']/}
-  text=${text//$'\xE2\x81\xA3'/}
-  after=${after//[$' \t\r\n\v\f']/}
-  after=${after//$'\xE2\x81\xA3'/}
+  _fm_backend_herdr_payload_normalize_var text
+  _fm_backend_herdr_payload_normalize_var after
   [ -n "$text" ] && [ -n "$after" ] || return 1
   [ "$after" = "$text" ] && return 0
   literal=$after
@@ -3463,6 +3459,38 @@ fm_backend_herdr_composer_payload_shown() {  # <text> <after>
     literal=${literal/"${BASH_REMATCH[0]}"/}
   done
   [ -z "$literal" ]
+}
+
+_fm_backend_herdr_payload_normalize_var() {  # <varname>
+  local __fmpn_text
+  fm_composer_normalize_spaces_var "$1"
+  __fmpn_text=${!1}
+  __fmpn_text=${__fmpn_text//[$' \t\r\n\v\f']/}
+  __fmpn_text=${__fmpn_text//$'\xE2\x81\xA3'/}
+  printf -v "$1" '%s' "$__fmpn_text"
+}
+
+# fm_backend_herdr_composer_payload_wait: poll until the composer, empty
+# before the send, shows <text> (fm_backend_herdr_composer_payload_shown).
+# A busy or long Claude session can render typed input well after the
+# caller's settle, so a read that is empty, unreadable, or a prefix of the
+# payload keeps waiting, up to FM_BACKEND_HERDR_PAYLOAD_POLLS reads 0.2s
+# apart. Any other content fails at once.
+fm_backend_herdr_composer_payload_wait() {  # <target> <text>
+  local target=$1 text=$2 content norm_text norm_content i=0
+  norm_text=$text
+  _fm_backend_herdr_payload_normalize_var norm_text
+  while :; do
+    if content=$(fm_backend_herdr_composer_content "$target"); then
+      fm_backend_herdr_composer_payload_shown "$text" "$content" && return 0
+      norm_content=$content
+      _fm_backend_herdr_payload_normalize_var norm_content
+      [[ $norm_text == "$norm_content"* ]] || return 1
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "${FM_BACKEND_HERDR_PAYLOAD_POLLS:-25}" ] || return 1
+    sleep 0.2
+  done
 }
 
 # fm_backend_herdr_composer_clear: after a refused proof, press Ctrl+U until
@@ -3503,8 +3531,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
   if [ "$proof" = 1 ]; then
-    if ! content=$(fm_backend_herdr_composer_content "$target") \
-      || ! fm_backend_herdr_composer_payload_shown "$text" "$content"; then
+    if ! fm_backend_herdr_composer_payload_wait "$target" "$text"; then
       if fm_backend_herdr_composer_clear "$target" "$text"; then
         printf 'send-failed'
       else

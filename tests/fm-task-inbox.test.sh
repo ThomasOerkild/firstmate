@@ -336,7 +336,7 @@ case "${1:-}" in
     rule=$(printf '─%.0s' $(seq 64))
     printf '● done\n%s\n' "$rule"
     if [ -s "$FM_FAKE_COMPOSER" ]; then
-      fold -w 60 "$FM_FAKE_COMPOSER" | awk 'NR == 1 { print "❯ " $0; next } { print "  " $0 }'
+      fold -w "${FM_FAKE_WIDTH:-60}" "$FM_FAKE_COMPOSER" | awk 'NR == 1 { print "❯ " $0; next } { print "  " $0 }'
     else
       printf '❯ \n'
     fi
@@ -347,6 +347,91 @@ esac
 exit 0
 SH
   chmod +x "$1/fakebin/tmux"
+}
+
+# A Herdr pane stub for the ring: the server runs, the pane renders a
+# Claude-style composer holding FM_FAKE_COMPOSER wrapped at 26 columns, native
+# agent state is always working, and Enter submits the composer (logged as
+# SUBMIT). Every other call fails, so the endpoint classifies unreadable and
+# still rings.
+make_herdr_composer_stub() {  # <dir>
+  mkdir -p "$1/fakebin"
+  cat > "$1/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  'status --json') printf '{"client":{"protocol":1},"server":{"running":true,"protocol":1}}\n' ;;
+  'agent get') printf '{"result":{"agent":{"agent":"claude","agent_status":"working"}}}\n' ;;
+  'pane read')
+    rule=$(printf '─%.0s' $(seq 30))
+    printf '● working\n%s\n' "$rule"
+    if [ -s "$FM_FAKE_COMPOSER" ]; then
+      fold -w 26 "$FM_FAKE_COMPOSER" | awk 'NR == 1 { print "❯ " $0; next } { print "  " $0 }'
+    else
+      printf '❯ \n'
+    fi
+    printf '%s\n  ? for shortcuts\n' "$rule" ;;
+  'pane send-keys')
+    if [ "${4:-}" = enter ] && [ -s "$FM_FAKE_COMPOSER" ]; then
+      printf 'SUBMIT: %s\n' "$(cat "$FM_FAKE_COMPOSER")" >> "$FM_SEND_LOG"
+      : > "$FM_FAKE_COMPOSER"
+    fi ;;
+  'pane send-text') printf '%s' "$4" >> "$FM_FAKE_COMPOSER" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$1/fakebin/herdr"
+}
+
+# A doorbell left typed by an earlier ring is ours on every backend: it is
+# submitted on a busy agent (a busy harness queues it) and when the pane is
+# narrow enough to wrap it over many rows, and other pending text still skips.
+test_ring_submits_its_own_stuck_doorbell_on_a_busy_narrow_herdr_pane() {
+  local dir state rec doorbell log composer rc
+  dir="$TMP_ROOT/ring-stuck-herdr"
+  state="$dir/state"
+  mkdir -p "$state"
+  make_herdr_composer_stub "$dir"
+  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "please continue")
+  doorbell=$(inbox_lib "$state" fm_task_inbox_doorbell_line "$rec")
+  log="$dir/send.log"; composer="$dir/composer"
+  : > "$log"; printf '%s' "$doorbell" > "$composer"
+  rc=0
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$log" FM_FAKE_COMPOSER="$composer" \
+    inbox_lib "$state" fm_task_inbox_ring herdr sess:w1:p2 "$rec" || rc=$?
+  [ "$rc" = 0 ] || fail "a busy narrow Herdr pane holding our own doorbell should be submitted, got rc $rc"
+  [ "$(cat "$log")" = "SUBMIT: $doorbell" ] \
+    || fail "the stuck doorbell on a busy Herdr pane should be submitted exactly once:"$'\n'"$(cat "$log")"
+  : > "$log"; printf '%s' 'a half-typed draft' > "$composer"
+  rc=0
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$log" FM_FAKE_COMPOSER="$composer" \
+    inbox_lib "$state" fm_task_inbox_ring herdr sess:w1:p2 "$rec" || rc=$?
+  [ "$rc" = 1 ] || fail "other pending text on a Herdr pane should skip the ring, got rc $rc"
+  [ ! -s "$log" ] || fail "other pending text on a Herdr pane was submitted:"$'\n'"$(cat "$log")"
+  pass "inbox: the ring submits its own stuck doorbell on a busy narrow Herdr pane and still skips other text"
+}
+
+# A submit that cannot confirm its Enter can leave our doorbell typed. The same
+# ring re-reads the composer and submits our own line, so it never blocks the
+# next ring.
+test_ring_submits_a_doorbell_its_own_submit_left_typed() {
+  local dir state rec doorbell log composer drops rc
+  dir="$TMP_ROOT/ring-left-typed"
+  state="$dir/state"
+  mkdir -p "$state"
+  make_composer_stub "$dir"
+  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "please continue")
+  doorbell=$(inbox_lib "$state" fm_task_inbox_doorbell_line "$rec")
+  log="$dir/send.log"; composer="$dir/composer"; drops="$dir/drops"
+  : > "$log"; : > "$composer"; echo 2 > "$drops"
+  rc=0
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$log" FM_FAKE_COMPOSER="$composer" FM_FAKE_WIDTH=26 \
+    FM_FAKE_DROP_ENTERS="$drops" inbox_lib "$state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 || rc=$?
+  [ "$rc" = 0 ] || fail "a doorbell left typed by an unconfirmed submit should be submitted, got rc $rc"
+  [ "$(cat "$log")" = "SUBMIT: $doorbell" ] \
+    || fail "the left-typed doorbell should be submitted once, not retyped:"$'\n'"$(cat "$log")"
+  [ ! -s "$composer" ] || fail "the left-typed doorbell stayed in the composer"
+  pass "inbox: the ring submits a doorbell its own unconfirmed submit left typed in a narrow pane"
 }
 
 # The stuck-doorbell deadlock: a doorbell whose Enter never landed sits in the
@@ -1186,6 +1271,8 @@ test_doorbell_is_a_shell_noop
 test_doorbell_rejects_terminal_controls
 test_ring_skips_dead_agent
 test_ring_submits_its_own_stuck_doorbell
+test_ring_submits_its_own_stuck_doorbell_on_a_busy_narrow_herdr_pane
+test_ring_submits_a_doorbell_its_own_submit_left_typed
 test_idempotent_write_dedups_exact_body
 test_idempotent_write_follows_concurrent_ack
 test_handled_mv_dedups_by_sequence

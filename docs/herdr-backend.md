@@ -671,13 +671,14 @@ Typed-plane text is typed once; only Enter is retried.
 When native `agent get` identity is Claude, the adapter types only into an empty composer.
 A Claude composer that already holds text, or cannot be read, before the send is refused with nothing typed.
 Before that Enter, the adapter continues only when the selected composer shows the typed payload, or only Claude paste placeholders with no literal remainder.
-Every herdr adapter composer read (`fm_backend_herdr_composer_state`, `fm_backend_herdr_composer_content`) captures the full visible viewport, never a bounded tail, while the shared inbox pending-line confirmation read (bin/fm-task-inbox-lib.sh) stays a bounded tail on every backend: an overlay Claude renders between the composer and the pane bottom - the slash-command popup is the verified shape - pushes the composer outside a tail window, and the composer is by definition inside the viewport.
+A busy or long Claude session can render typed input after the settle, so a composer that is still empty or shows only a head of the payload is read again, up to `FM_BACKEND_HERDR_PAYLOAD_POLLS` reads (default 25) 0.2 seconds apart, before the proof fails.
+Every herdr adapter composer read (`fm_backend_herdr_composer_state`, `fm_backend_herdr_composer_content`) and the shared inbox pending-line read (bin/fm-task-inbox-lib.sh) captures the full visible viewport, never a bounded tail: an overlay Claude renders between the composer and the pane bottom - the slash-command popup is the verified shape - pushes the composer outside a tail window, and the composer is by definition inside the viewport.
 Dated measurement: docs/verification/runtime-backends.md "Claude exit behind the slash-command popup".
 
 That comparison ignores whitespace and U+2063, the invisible mark that starts operational inputs and ends the from-firstmate label.
 It ignores U+2063 because Claude's Herdr read-back never shows it.
 
-A composer that holds a shorter suffix, or a placeholder plus a literal remainder, does not receive Enter.
+A composer that holds a shorter suffix, a placeholder plus a literal remainder, or a head that does not complete within the reads above, does not receive Enter.
 Instead:
 
 1. The adapter presses Ctrl+U until the shared classifier reads the composer as empty.

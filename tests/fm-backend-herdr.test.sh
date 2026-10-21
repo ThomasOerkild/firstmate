@@ -5243,6 +5243,46 @@ test_send_text_submit_refuses_marked_digest_missing_its_head() {
   pass "fm_backend_herdr_send_text_submit: dropping U+2063 does not let a marked digest missing its head be submitted"
 }
 
+# A busy or long Claude session can render typed input after the settle. A
+# composer that is still empty or shows only a head of the payload is polled,
+# not cleared, and is submitted once the whole payload shows. A head that never
+# completes within the poll budget is cleared and never submitted.
+test_send_text_submit_claude_waits_for_a_slow_composer_render() {
+  local dir log resp fb out enter_count text
+  dir="$TMP_ROOT/submit-claude-slow-render"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  text=': Firstmate instruction waiting: list the steering inbox, then mv each into its handled/.'
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
+  printf '  \xe2\x9d\xaf\n' > "$resp/2.out"
+  printf '  \xe2\x9d\xaf\n' > "$resp/4.out"
+  printf '  \xe2\x9d\xaf %s\n' "${text:0:30}" > "$resp/5.out"
+  printf '  \xe2\x9d\xaf %s\n' "$text" > "$resp/6.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/7.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/9.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "$1" 3 0.01 0.01' "$ROOT" "$text" )
+  [ "$out" = empty ] || fail "a payload that renders after the settle should be submitted, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "a slowly rendered payload should be submitted once, sent $enter_count Enter(s)"
+  [ "$(herdr_ctrl_u_count "$log")" -eq 0 ] || fail "a payload still rendering must not be cleared"
+
+  dir="$TMP_ROOT/submit-claude-slow-render-timeout"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
+  printf '  \xe2\x9d\xaf\n' > "$resp/2.out"
+  printf '  \xe2\x9d\xaf %s\n' "${text:0:30}" > "$resp/4.out"
+  printf '  \xe2\x9d\xaf %s\n' "${text:0:30}" > "$resp/5.out"
+  printf '  \xe2\x9d\xaf\n' > "$resp/7.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    FM_BACKEND_HERDR_PAYLOAD_POLLS=2 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "$1" 3 0.01 0.01' "$ROOT" "$text" )
+  [ "$out" = send-failed ] || fail "a payload head that never completes should report send-failed, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 0 ] || fail "an incomplete payload must not be submitted, sent $enter_count Enter(s)"
+  [ "$(herdr_ctrl_u_count "$log")" -eq 1 ] || fail "an incomplete payload should be cleared after the poll budget"
+  pass "fm_backend_herdr_send_text_submit: a slow Claude render is polled until the payload shows, and an incomplete one is cleared"
+}
+
 # Claude Code 2.1.283 renders a slash-command popup between the composer and
 # the pane bottom, pushing the composer row outside a 20-row tail window. The
 # composer reads must capture the full visible viewport: the old bounded read
@@ -6223,6 +6263,7 @@ test_send_text_submit_claude_refuses_to_type_into_a_nonempty_composer
 test_send_text_submit_refuses_suffix_when_transcript_still_shows_the_head
 test_send_text_submit_accepts_marked_payloads_whose_read_back_drops_u2063
 test_send_text_submit_refuses_marked_digest_missing_its_head
+test_send_text_submit_claude_waits_for_a_slow_composer_render
 test_composer_state_claude_slash_popup_pushes_composer_above_tail_window
 test_send_text_submit_claude_slash_popup_composer_is_still_proven_and_submitted
 test_send_text_submit_claude_grey_slash_command_is_proven_and_submitted
